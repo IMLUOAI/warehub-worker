@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Warehub — Plans & Pricing</title>
+<script
+  async
+  crossorigin="anonymous"
+  data-clerk-publishable-key="pk_test_Z29sZGVuLW1hZ3BpZS01NC5jbGVyay5hY2NvdW50cy5kZXYk"
+  src="https://golden-magpie-54.clerk.accounts.dev/npm/@clerk/clerk-js@latest/dist/clerk.browser.js"
+></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:#0d1117;color:#e2e8f0;font-family:system-ui,-apple-system,sans-serif;min-height:100vh;}
+  .nav{display:flex;align-items:center;justify-content:space-between;padding:16px 32px;border-bottom:1px solid #1e2a3a;}
+  .logo{font-size:20px;font-weight:800;letter-spacing:-0.5px;}
+  .logo span{color:#4a9eff;}
+  .nav-right{display:flex;align-items:center;gap:12px;}
+  .btn{padding:8px 18px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:opacity .15s;}
+  .btn:hover{opacity:.85;}
+  .btn-outline{background:transparent;border:1px solid #2d3748;color:#e2e8f0;}
+  .btn-primary{background:#4a9eff;color:#fff;}
+  .btn-pro{background:linear-gradient(135deg,#c77dff,#4a9eff);color:#fff;}
+  .hero{text-align:center;padding:64px 24px 48px;}
+  .hero h1{font-size:40px;font-weight:800;letter-spacing:-1px;margin-bottom:12px;}
+  .hero h1 span{color:#4a9eff;}
+  .hero p{font-size:16px;color:#7096b8;max-width:480px;margin:0 auto;}
+  .plans{display:flex;gap:24px;justify-content:center;padding:0 24px 64px;flex-wrap:wrap;}
+  .plan{background:#111827;border:1px solid #1e2a3a;border-radius:12px;padding:32px;width:320px;position:relative;}
+  .plan.popular{border-color:#c77dff;box-shadow:0 0 0 1px #c77dff;}
+  .popular-badge{position:absolute;top:-12px;left:50%;transform:translateX(-50%);
+    background:linear-gradient(135deg,#c77dff,#4a9eff);color:#fff;
+    font-size:10px;font-weight:700;letter-spacing:1px;padding:4px 14px;border-radius:20px;}
+  .plan-name{font-size:13px;font-weight:700;letter-spacing:2px;color:#7096b8;margin-bottom:8px;}
+  .plan-price{font-size:42px;font-weight:800;letter-spacing:-1px;margin-bottom:4px;}
+  .plan-price span{font-size:16px;font-weight:400;color:#7096b8;}
+  .plan-desc{font-size:13px;color:#7096b8;margin-bottom:24px;line-height:1.5;}
+  .plan-features{list-style:none;margin-bottom:32px;}
+  .plan-features li{font-size:13px;padding:6px 0;border-bottom:1px solid #1e2a3a;display:flex;align-items:center;gap:8px;}
+  .plan-features li:last-child{border:none;}
+  .check{color:#4caf80;font-size:14px;}
+  .plan-btn{width:100%;padding:12px;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;border:none;transition:opacity .15s;}
+  .plan-btn:hover{opacity:.85;}
+  .plan-btn:disabled{opacity:.5;cursor:not-allowed;}
+  .starter-btn{background:#4a9eff;color:#fff;}
+  .pro-btn{background:linear-gradient(135deg,#c77dff,#4a9eff);color:#fff;}
+  .trial-note{text-align:center;font-size:12px;color:#4a6080;padding-bottom:48px;}
+  .msg{text-align:center;padding:12px;font-size:13px;border-radius:6px;margin:0 24px 24px;display:none;}
+  .msg.success{background:#1a3a2a;border:1px solid #4caf80;color:#4caf80;display:block;}
+  .msg.error{background:#3a1a1a;border:1px solid #f56565;color:#f56565;display:block;}
+  #user-bar{text-align:center;padding:8px;font-size:12px;color:#4a6080;border-bottom:1px solid #1e2a3a;}
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="logo">🏭 WARE<span>HUB</span></div>
+  <div class="nav-right">
+    <div id="clerk-user-area"></div>
+    <a href="https://imluoai.github.io/warehub" class="btn btn-outline">← Back to App</a>
+  </div>
+</nav>
+
+<div id="user-bar" style="display:none;"></div>
+<div id="msg" class="msg"></div>
+
+<div class="hero">
+  <h1>Simple, transparent <span>pricing</span></h1>
+  <p>Everything you need to run your warehouse operation — no hidden fees, cancel any time.</p>
+</div>
+
+<div class="plans">
+
+  <!-- Starter -->
+  <div class="plan">
+    <div class="plan-name">STARTER</div>
+    <div class="plan-price">$79<span>/month</span></div>
+    <div class="plan-desc">Perfect for a single warehouse location with a small team.</div>
+    <ul class="plan-features">
+      <li><span class="check">✓</span> Order queue &amp; barcode scanning</li>
+      <li><span class="check">✓</span> PDF label import (all carriers)</li>
+      <li><span class="check">✓</span> Packer time tracking &amp; stats</li>
+      <li><span class="check">✓</span> Vehicle trip log</li>
+      <li><span class="check">✓</span> Returns intake</li>
+      <li><span class="check">✓</span> FBA outbound records</li>
+      <li><span class="check">✓</span> Excel &amp; CSV exports</li>
+      <li><span class="check">✓</span> Up to 10 packers</li>
+    </ul>
+    <button class="plan-btn starter-btn" id="btn-starter" onclick="checkout('starter')">
+      Get Started — $79/mo
+    </button>
+  </div>
+
+  <!-- Pro -->
+  <div class="plan popular">
+    <div class="popular-badge">MOST POPULAR</div>
+    <div class="plan-name">PRO</div>
+    <div class="plan-price">$149<span>/month</span></div>
+    <div class="plan-desc">For growing operations with multiple locations and teams.</div>
+    <ul class="plan-features">
+      <li><span class="check">✓</span> Everything in Starter</li>
+      <li><span class="check">✓</span> Unlimited packers</li>
+      <li><span class="check">✓</span> Multi-location support</li>
+      <li><span class="check">✓</span> FedEx live tracking status</li>
+      <li><span class="check">✓</span> Rack map &amp; inventory</li>
+      <li><span class="check">✓</span> AI assistant (Claude-powered)</li>
+      <li><span class="check">✓</span> Priority support</li>
+      <li><span class="check">✓</span> Early access to new features</li>
+    </ul>
+    <button class="plan-btn pro-btn" id="btn-pro" onclick="checkout('pro')">
+      Get Pro — $149/mo
+    </button>
+  </div>
+
+</div>
+
+<div class="trial-note">
+  All plans include a 14-day free trial · No credit card required to start · Cancel any time
+</div>
+
+<script>
+const WORKER = 'https://warehub-worker.imluoai.workers.dev';
+var _token = null;
+
+function showMsg(text, type) {
+  var el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = 'msg ' + type;
+}
+
+async function checkout(plan) {
+  if (!_token) {
+    showMsg('Please sign in first to subscribe.', 'error');
+    window.Clerk.openSignIn();
+    return;
+  }
+  var btn = document.getElementById('btn-' + plan);
+  btn.disabled = true;
+  btn.textContent = '⟳ Loading…';
+  try {
+    var APP_URL = 'https://imluoai.github.io/warehub-app/';
+    var resp = await fetch(WORKER + '/api/billing/checkout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + _token },
+      body: JSON.stringify({
+        plan,
+        successUrl: APP_URL + '?billing=success',
+        cancelUrl:  window.location.href,
+      }),
+    });
+    var data = await resp.json();
+    if (data.url) {
+      window.location.href = data.url;
+    } else {
+      showMsg(data.error || 'Something went wrong. Please try again.', 'error');
+      btn.disabled = false;
+      btn.textContent = plan === 'pro' ? 'Get Pro — $149/mo' : 'Get Started — $79/mo';
+    }
+  } catch(e) {
+    showMsg('Network error — please try again.', 'error');
+    btn.disabled = false;
+    btn.textContent = plan === 'pro' ? 'Get Pro — $149/mo' : 'Get Started — $79/mo';
+  }
+}
+
+async function initBillingPage() {
+  await window.Clerk.load();
+
+  // Check for success/cancelled redirect
+  var params = new URLSearchParams(window.location.search);
+  if (params.get('billing') === 'success') {
+    showMsg('🎉 Subscription activated! You can now return to the app.', 'success');
+  } else if (params.get('billing') === 'cancelled') {
+    showMsg('Checkout cancelled — no charge was made.', 'error');
+  }
+
+  if (window.Clerk.user) {
+    _token = await window.Clerk.session.getToken();
+    var userBar = document.getElementById('user-bar');
+    userBar.style.display = 'block';
+    userBar.textContent = 'Signed in as ' + (window.Clerk.user.emailAddresses[0]?.emailAddress || '');
+
+    // Mount user button in nav
+    window.Clerk.mountUserButton(document.getElementById('clerk-user-area'));
+  } else {
+    window.Clerk.mountSignIn(document.getElementById('clerk-user-area'), {
+      afterSignInUrl: window.location.href,
+    });
+  }
+}
+
+if (window.Clerk) {
+  initBillingPage();
+} else {
+  document.querySelector('[data-clerk-publishable-key]')
+    .addEventListener('load', initBillingPage);
+}
+</script>
+</body>
+</html>

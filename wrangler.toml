@@ -1,0 +1,25 @@
+name = "warehub-worker"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "warehub-db"
+database_id = "75863305-8caf-4fa4-a026-916a78849747"
+
+[vars]
+ENVIRONMENT = "production"
+CORS_ORIGIN = "https://imluoai.github.io"
+
+# ── Cron trigger — nightly AI analysis at 02:00 UTC ──────────────
+[triggers]
+crons = ["0 2 * * *"]
+
+# Secrets — set these via: wrangler secret put SECRET_NAME
+# CLERK_SECRET_KEY
+# STRIPE_SECRET_KEY
+# STRIPE_WEBHOOK_SECRET
+# ANTHROPIC_KEY   ← required for AI insights feature
+# FEDEX_CLIENT_ID
+# FEDEX_CLIENT_SECRET
