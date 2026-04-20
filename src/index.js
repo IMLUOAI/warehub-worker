@@ -797,8 +797,8 @@ async function createCheckoutSession(request, tenant, auth, env) {
     ).bind(customerId, tenant.id).run();
   }
 
-  const successUrl = b.successUrl || 'https://imluoai.github.io/warehub-app/?billing=success';
-  const cancelUrl  = b.cancelUrl  || 'https://imluoai.github.io/warehub-app/billing.html';
+  const successUrl = b.successUrl || 'https://app.wareplatform.com/?billing=success';
+  const cancelUrl  = b.cancelUrl  || 'https://app.wareplatform.com/billing.html';
 
   const session = await stripeRequest('/v1/checkout/sessions', 'POST', {
     customer:             customerId,
@@ -821,7 +821,7 @@ async function createBillingPortal(request, tenant, env) {
     return err('No billing account found — please subscribe first');
   }
   const b = await request.json().catch(() => ({}));
-  const returnUrl = b.returnUrl || 'https://imluoai.github.io/warehub';
+  const returnUrl = b.returnUrl || 'https://app.wareplatform.com/billing.html';
 
   const session = await stripeRequest('/v1/billing_portal/sessions', 'POST', {
     customer:   tenant.stripe_customer_id,
