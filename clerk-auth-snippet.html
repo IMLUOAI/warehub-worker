@@ -1,0 +1,169 @@
+<!--
+  ══════════════════════════════════════════════════════════════════
+  Warehub — Clerk Auth Integration Snippet
+  Add the <script> tag in <head>, and the init block before </body>
+  ══════════════════════════════════════════════════════════════════
+-->
+
+<!-- ① Add this in <head> (after existing meta tags) -->
+<script
+  async
+  crossorigin="anonymous"
+  data-clerk-publishable-key="pk_test_Z29sZGVuLW1hZ3BpZS01NC5jbGVyay5hY2NvdW50cy5kZXYk"
+  src="https://golden-magpie-54.clerk.accounts.dev/npm/@clerk/clerk-js@latest/dist/clerk.browser.js"
+  type="text/javascript"
+></script>
+
+<!-- ② Add this login screen div just after <body> opens, before the PIN screen -->
+<div
+  id="clerk-auth-screen"
+  style="
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    background: #0d1117;
+    font-family: 'Inter', system-ui, sans-serif;
+    gap: 24px;
+  "
+>
+  <div style="text-align: center; margin-bottom: 8px">
+    <div
+      style="
+        font-size: 28px;
+        font-weight: 800;
+        color: #e2e8f0;
+        letter-spacing: -0.5px;
+      "
+    >
+      🏭 WAREHUB
+    </div>
+    <div
+      style="
+        font-size: 11px;
+        letter-spacing: 3px;
+        color: #4a6080;
+        margin-top: 4px;
+      "
+    >
+      WAREHOUSE MANAGEMENT SYSTEM
+    </div>
+  </div>
+  <div id="clerk-mount-point" style="width: 100%; max-width: 400px"></div>
+</div>
+
+<!-- ③ Add this init block just before </body> -->
+<script>
+  // ── Warehub Clerk Auth ─────────────────────────────────────────────
+  const WORKER_URL = "https://warehub-worker.imluoai.workers.dev";
+
+  var _clerkToken = null;
+  var _clerkUser = null;
+  var _warehubTenantId = null;
+
+  async function warehubApiCall(method, path, body) {
+    if (!_clerkToken) throw new Error("Not authenticated");
+    const opts = {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + _clerkToken,
+      },
+    };
+    if (body) opts.body = JSON.stringify(body);
+    const resp = await fetch(WORKER_URL + path, opts);
+    if (resp.status === 401) {
+      await window.__clerk.signOut();
+      return null;
+    }
+    if (resp.status === 402) {
+      alert(
+        "Your Warehub subscription has expired. Please renew at your account portal."
+      );
+      return null;
+    }
+    return resp.json();
+  }
+
+  // Expose globally so existing app code can call it
+  window.warehubApi = warehubApiCall;
+
+  async function initClerkAuth() {
+    await window.Clerk.load();
+
+    const authScreen = document.getElementById("clerk-auth-screen");
+    const appRoot =
+      document.getElementById("app") ||
+      document.querySelector(".shell") ||
+      document.querySelector("body > *:not(#clerk-auth-screen)");
+
+    if (window.Clerk.user) {
+      // Already signed in — get fresh token and register/load tenant
+      await onSignedIn(window.Clerk.user);
+    } else {
+      // Show Clerk sign-in UI
+      if (appRoot) appRoot.style.display = "none";
+      window.Clerk.mountSignIn(document.getElementById("clerk-mount-point"), {
+        afterSignInUrl: window.location.href,
+        afterSignUpUrl: window.location.href,
+      });
+    }
+
+    // Listen for sign-in/out changes
+    window.Clerk.addListener(async ({ user }) => {
+      if (user) {
+        await onSignedIn(user);
+      } else {
+        _clerkToken = null;
+        _clerkUser = null;
+        if (authScreen) authScreen.style.display = "flex";
+        if (appRoot) appRoot.style.display = "none";
+      }
+    });
+  }
+
+  async function onSignedIn(user) {
+    const authScreen = document.getElementById("clerk-auth-screen");
+    const appRoot =
+      document.getElementById("app") ||
+      document.querySelector(".shell") ||
+      document.querySelector("body > *:not(#clerk-auth-screen)");
+
+    // Get a fresh JWT token
+    _clerkToken = await window.Clerk.session.getToken();
+    _clerkUser = user;
+    window.__clerk = window.Clerk;
+
+    // Register tenant on first sign-up (idempotent — safe to call every login)
+    try {
+      const email = user.emailAddresses[0]?.emailAddress || "";
+      const name = user.fullName || user.firstName || email;
+      const regResp = await fetch(WORKER_URL + "/api/tenants/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, email, clerkUserId: user.id }),
+      });
+      const regData = await regResp.json();
+      _warehubTenantId = regData.tenantId;
+    } catch (e) {
+      console.warn("[Warehub] Tenant registration failed:", e.message);
+    }
+
+    // Hide auth screen, show app
+    if (authScreen) authScreen.style.display = "none";
+    if (appRoot) appRoot.style.display = "";
+
+    // Kick off the normal app init (your existing appInit function)
+    if (typeof appInit === "function") appInit();
+  }
+
+  // Start Clerk when script is ready
+  if (window.Clerk) {
+    initClerkAuth();
+  } else {
+    document
+      .querySelector("[data-clerk-publishable-key]")
+      .addEventListener("load", initClerkAuth);
+  }
+</script>

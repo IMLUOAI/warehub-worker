@@ -10,7 +10,7 @@ database_id = "75863305-8caf-4fa4-a026-916a78849747"
 
 [vars]
 ENVIRONMENT = "production"
-CORS_ORIGIN = "https://imluoai.github.io"
+CORS_ORIGIN = "https://app.wareplatform.com"
 
 # ── Cron trigger — nightly AI analysis at 02:00 UTC ──────────────
 [triggers]
