@@ -143,7 +143,8 @@ async function resolveAuth(request, env) {
 // touches the DB itself beyond the auth check already done by the
 // router before it gets here.
 async function handleAiChat(request, tenant, env) {
-  if (!env.ANTHROPIC_KEY) return err("AI is not configured for this deployment.", 503);
+  if (!env.ANTHROPIC_KEY)
+    return err("AI is not configured for this deployment.", 503);
 
   let body;
   try {
@@ -177,7 +178,11 @@ async function handleAiChat(request, tenant, env) {
 
   const data = await resp.json();
   if (!resp.ok) {
-    console.error("[Warehub AI] Anthropic error:", resp.status, JSON.stringify(data));
+    console.error(
+      "[Warehub AI] Anthropic error:",
+      resp.status,
+      JSON.stringify(data)
+    );
     return err(data.error?.message || "AI request failed", resp.status);
   }
 
@@ -221,7 +226,7 @@ async function handleRequest(request, env, ctx) {
   if (method === "POST" && path === "/api/tenants/register") {
     return handleRegister(request, env);
   }
-  if (method === "POST" && path === "/api/stripe/webhook") {
+  if (method === "POST" && path === "/api/billing/webhook") {
     return handleStripeWebhook(request, env);
   }
   if (method === "GET" && path === "/api/billing/plans") {
@@ -927,6 +932,7 @@ async function saveSettings(request, tenant, env) {
 // ── Stripe helpers ────────────────────────────────────────────────
 
 const STRIPE_PRICES = {
+  basic: "price_1u318p2LoLs8cdPy6004A41x",
   starter: "price_1TLRhV2LoLs8cdPyZWNNFkUd",
   pro: "price_1TLRiZ2LoLs8cdPy7UXwltuD",
 };
