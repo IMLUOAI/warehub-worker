@@ -32,7 +32,6 @@ function err(message, status = 400) {
 }
 
 function b64url(str) {
-  // Base64url → base64: replace URL-safe chars, then add required padding
   str = str.replace(/-/g, "+").replace(/_/g, "/");
   while (str.length % 4) str += "=";
   return atob(str);
@@ -60,15 +59,12 @@ async function verifyClerkJWT(token) {
     const header = JSON.parse(b64url(parts[0]));
     const payload = JSON.parse(b64url(parts[1]));
 
-    // Check expiry
     if (payload.exp && Date.now() / 1000 > payload.exp) return null;
 
-    // Find matching key by kid
     const keys = await getJwks();
     const jwk = keys.find((k) => k.kid === header.kid);
     if (!jwk) return null;
 
-    // Import key and verify signature
     const key = await crypto.subtle.importKey(
       "jwk",
       jwk,
@@ -93,7 +89,6 @@ async function verifyClerkJWT(token) {
 }
 
 // ── Auth middleware ───────────────────────────────────────────────
-// Returns { tenant, clerkUserId } or null
 
 async function resolveAuth(request, env) {
   const authHeader = request.headers.get("Authorization");
@@ -108,7 +103,7 @@ async function resolveAuth(request, env) {
   const row = await env.DB.prepare(
     `SELECT u.id as userId, u.role, u.name as userName, u.email as userEmail,
             t.id as tenantId, t.name as tenantName, t.plan, t.plan_expires_at,
-            t.stripe_customer_id, t.stripe_subscription_id
+            t.stripe_customer_id, t.stripe_subscription_id, t.cancel_at_period_end
      FROM users u
      JOIN tenants t ON t.id = u.tenant_id
      WHERE u.clerk_user_id = ?`
@@ -128,23 +123,21 @@ async function resolveAuth(request, env) {
       name: row.tenantName,
       plan: row.plan,
       plan_expires_at: row.plan_expires_at,
+      cancel_at_period_end: !!row.cancel_at_period_end,
       stripe_customer_id: row.stripe_customer_id || null,
       stripe_subscription_id: row.stripe_subscription_id || null,
     },
   };
 }
 
+function requireOwner(auth) {
+  if (auth.role !== "owner") return err("Only the account owner can do this", 403);
+  return null;
+}
+
 // ── Interactive AI chat/actions proxy ────────────────────────────
-// Thin authenticated pass-through to Anthropic — same request shape
-// the client already builds (model/system/tools/messages), same
-// ANTHROPIC_KEY already used by the nightly analyzeTenant() job.
-// The client owns building the tenant's shift context and executing
-// any "actions" the model proposes locally, so this route never
-// touches the DB itself beyond the auth check already done by the
-// router before it gets here.
 async function handleAiChat(request, tenant, env) {
-  if (!env.ANTHROPIC_KEY)
-    return err("AI is not configured for this deployment.", 503);
+  if (!env.ANTHROPIC_KEY) return err("AI is not configured for this deployment.", 503);
 
   let body;
   try {
@@ -156,8 +149,6 @@ async function handleAiChat(request, tenant, env) {
   const messages = Array.isArray(body.messages) ? body.messages : null;
   if (!messages || !messages.length) return err("messages is required", 400);
 
-  // Defense in depth: clamp what a (possibly tampered) client can ask
-  // for, regardless of what it sends.
   const maxTokens = Math.min(Number(body.max_tokens) || 2000, 4096);
 
   const resp = await fetch("https://api.anthropic.com/v1/messages", {
@@ -178,11 +169,7 @@ async function handleAiChat(request, tenant, env) {
 
   const data = await resp.json();
   if (!resp.ok) {
-    console.error(
-      "[Warehub AI] Anthropic error:",
-      resp.status,
-      JSON.stringify(data)
-    );
+    console.error("[Warehub AI] Anthropic error:", resp.status, JSON.stringify(data));
     return err(data.error?.message || "AI request failed", resp.status);
   }
 
@@ -207,7 +194,6 @@ export default {
     }
   },
 
-  // ── Nightly cron: runs at 02:00 UTC every day ──────────────────
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runNightlyAnalysis(env));
   },
@@ -239,31 +225,36 @@ async function handleRequest(request, env, ctx) {
 
   const { tenant } = auth;
 
-  // Block expired/suspended plans
-  if (tenant.plan_expires_at && new Date(tenant.plan_expires_at) < new Date()) {
+  // Only block access once the period has passed AND it's not set to
+  // auto-renew — an auto-renewing sub's plan_expires_at is just next
+  // month's billing date, not a cutoff. If a renewal webhook is late,
+  // this avoids locking out a paying customer.
+  if (
+    tenant.cancel_at_period_end &&
+    tenant.plan_expires_at &&
+    new Date(tenant.plan_expires_at) < new Date()
+  ) {
     return err(
       "Subscription expired — please renew at app.warehub.com/billing",
       402
     );
   }
 
-  // ── Health ────────────────────────────────────────────────────
   if (path === "/api/health") {
     return json({ status: "ok", tenant: tenant.name, plan: tenant.plan });
   }
 
-  // ── AI chat/actions ───────────────────────────────────────────
   if (path === "/api/ai" && method === "POST") {
     return handleAiChat(request, tenant, env);
   }
 
-  // ── Billing ───────────────────────────────────────────────────
   if (path === "/api/billing/status" && method === "GET") {
-    const active = tenant.plan === "starter" || tenant.plan === "pro";
+    const active = tenant.plan === "starter" || tenant.plan === "pro" || tenant.plan === "basic";
     return json({
       plan: tenant.plan || "trial",
       active,
       expiresAt: tenant.plan_expires_at || null,
+      cancelAtPeriodEnd: tenant.cancel_at_period_end || false,
     });
   }
   if (path === "/api/billing/checkout" && method === "POST") {
@@ -271,6 +262,28 @@ async function handleRequest(request, env, ctx) {
   }
   if (path === "/api/billing/portal" && method === "POST") {
     return createBillingPortal(request, tenant, env);
+  }
+
+  // ── Team management (owner only) ───────────────────────────────
+  if (path === "/api/team" && method === "GET") {
+    return getTeam(tenant, env);
+  }
+  if (path === "/api/team/invite" && method === "POST") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    return inviteTeamMember(request, tenant, auth, env);
+  }
+  const inviteCancelMatch = path.match(/^\/api\/team\/invite\/([^/]+)$/);
+  if (inviteCancelMatch && method === "DELETE") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    return cancelInvite(tenant, inviteCancelMatch[1], env);
+  }
+  const teamMemberMatch = path.match(/^\/api\/team\/([^/]+)$/);
+  if (teamMemberMatch && method === "DELETE") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    return removeTeamMember(tenant, auth, teamMemberMatch[1], env);
   }
 
   // ── Packers ───────────────────────────────────────────────────
@@ -380,9 +393,9 @@ async function handleRegister(request, env) {
     return err("name, email and clerkUserId are required");
   }
 
-  // Check if user already exists (re-registration guard)
+  // Already-registered user (any role) — just return their tenant/role
   const existing = await env.DB.prepare(
-    `SELECT u.tenant_id, t.plan, t.plan_expires_at
+    `SELECT u.tenant_id, u.role, t.plan, t.plan_expires_at
      FROM users u JOIN tenants t ON t.id = u.tenant_id
      WHERE u.clerk_user_id = ?`
   )
@@ -392,11 +405,46 @@ async function handleRegister(request, env) {
     return json({
       tenantId: existing.tenant_id,
       plan: existing.plan || "trial",
-      active: existing.plan === "starter" || existing.plan === "pro",
+      active: existing.plan === "starter" || existing.plan === "pro" || existing.plan === "basic",
+      role: existing.role,
       existing: true,
     });
   }
 
+  // Check for a pending invite matching this email — join that tenant
+  // instead of creating a brand new one.
+  const invite = await env.DB.prepare(
+    `SELECT i.id as inviteId, i.tenant_id, i.role, t.plan, t.plan_expires_at
+     FROM invites i JOIN tenants t ON t.id = i.tenant_id
+     WHERE lower(i.email) = lower(?) AND i.accepted_at IS NULL`
+  )
+    .bind(email)
+    .first();
+
+  if (invite) {
+    const userId = uuid();
+    await env.DB.prepare(
+      `INSERT INTO users (id, tenant_id, clerk_user_id, email, name, role)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+      .bind(userId, invite.tenant_id, clerkUserId, email, name, invite.role || "packer")
+      .run();
+    await env.DB.prepare(
+      `UPDATE invites SET accepted_at = unixepoch() WHERE id = ?`
+    )
+      .bind(invite.inviteId)
+      .run();
+
+    return json({
+      tenantId: invite.tenant_id,
+      plan: invite.plan || "trial",
+      active: invite.plan === "starter" || invite.plan === "pro" || invite.plan === "basic",
+      role: invite.role || "packer",
+      existing: false,
+    });
+  }
+
+  // No invite — create a brand-new tenant, this user becomes the owner
   const tenantId = uuid();
   const userId = uuid();
 
@@ -413,7 +461,82 @@ async function handleRegister(request, env) {
     .bind(userId, tenantId, clerkUserId, email, name)
     .run();
 
-  return json({ tenantId, userId, plan: "trial", active: false }, 201);
+  return json({ tenantId, userId, plan: "trial", active: false, role: "owner" }, 201);
+}
+
+// ── Team management ─────────────────────────────────────────────
+
+async function getTeam(tenant, env) {
+  const { results: members } = await env.DB.prepare(
+    `SELECT id, name, email, role FROM users WHERE tenant_id = ? ORDER BY role DESC, name`
+  )
+    .bind(tenant.id)
+    .all();
+
+  const { results: pending } = await env.DB.prepare(
+    `SELECT id, email, role, created_at FROM invites
+     WHERE tenant_id = ? AND accepted_at IS NULL ORDER BY created_at DESC`
+  )
+    .bind(tenant.id)
+    .all();
+
+  return json({ members, pendingInvites: pending });
+}
+
+async function inviteTeamMember(request, tenant, auth, env) {
+  const b = await request.json().catch(() => ({}));
+  const email = (b.email || "").trim().toLowerCase();
+  const role = b.role === "manager" ? "manager" : "packer"; // only owner/manager/packer allowed via invite
+  if (!email || !email.includes("@")) return err("A valid email is required");
+
+  const alreadyMember = await env.DB.prepare(
+    `SELECT id FROM users WHERE tenant_id = ? AND lower(email) = ?`
+  )
+    .bind(tenant.id, email)
+    .first();
+  if (alreadyMember) return err("That email is already on your team");
+
+  const existingInvite = await env.DB.prepare(
+    `SELECT id FROM invites WHERE tenant_id = ? AND lower(email) = ? AND accepted_at IS NULL`
+  )
+    .bind(tenant.id, email)
+    .first();
+  if (existingInvite) return err("An invite is already pending for that email");
+
+  const id = uuid();
+  await env.DB.prepare(
+    `INSERT INTO invites (id, tenant_id, email, role, invited_by)
+     VALUES (?, ?, ?, ?, ?)`
+  )
+    .bind(id, tenant.id, email, role, auth.userId)
+    .run();
+
+  return json({ ok: true, id }, 201);
+}
+
+async function cancelInvite(tenant, inviteId, env) {
+  await env.DB.prepare(
+    `DELETE FROM invites WHERE id = ? AND tenant_id = ? AND accepted_at IS NULL`
+  )
+    .bind(inviteId, tenant.id)
+    .run();
+  return json({ ok: true });
+}
+
+async function removeTeamMember(tenant, auth, userId, env) {
+  if (userId === auth.userId) return err("You can't remove yourself");
+  const target = await env.DB.prepare(
+    `SELECT role FROM users WHERE id = ? AND tenant_id = ?`
+  )
+    .bind(userId, tenant.id)
+    .first();
+  if (!target) return err("Team member not found", 404);
+  if (target.role === "owner") return err("Can't remove the account owner");
+
+  await env.DB.prepare(`DELETE FROM users WHERE id = ? AND tenant_id = ?`)
+    .bind(userId, tenant.id)
+    .run();
+  return json({ ok: true });
 }
 
 // ── Packers ───────────────────────────────────────────────────────
@@ -502,13 +625,11 @@ async function syncPackers(request, tenant, env) {
         .run();
     }
 
-    // Sync shift sessions
     if (Array.isArray(p.shiftSessions)) {
       for (const s of p.shiftSessions) {
         const clockIn = s.clockIn ? new Date(s.clockIn).toISOString() : null;
         const clockOut = s.clockOut ? new Date(s.clockOut).toISOString() : null;
         if (!clockIn) continue;
-        // Use a deterministic ID based on packer + clockIn to avoid duplicates
         const sessionId = "SES-" + p.id + "-" + new Date(s.clockIn).getTime();
         const existSes = await env.DB.prepare(
           `SELECT id FROM packer_sessions WHERE id = ?`
@@ -927,14 +1048,12 @@ async function saveSettings(request, tenant, env) {
   return json({ ok: true });
 }
 
-// ── Stripe webhook ────────────────────────────────────────────────
-
 // ── Stripe helpers ────────────────────────────────────────────────
 
 const STRIPE_PRICES = {
-  basic: "price_1u318p2LoLs8cdPy6004A41x",
-  starter: "price_1TLRhV2LoLs8cdPyZWNNFkUd",
-  pro: "price_1TLRiZ2LoLs8cdPy7UXwltuD",
+  basic: "price_1U8a4YRrPnCkZ2Dx2A94sTLI",
+  starter: "price_1U8a7tRrPnCkZ2DxwWu1KRHv",
+  pro: "price_1U8aBXRrPnCkZ2DxHXEaZJhA",
 };
 
 async function stripeRequest(path, method, body, env) {
@@ -983,6 +1102,20 @@ function getBillingPlans() {
   return json({
     plans: [
       {
+        id: "basic",
+        name: "Warehub Basic",
+        price: 29,
+        priceId: STRIPE_PRICES.basic,
+        description: "For solo sellers and small teams just getting started.",
+        features: [
+          "Order queue & barcode scanning",
+          "PDF label import (all carriers)",
+          "Basic productivity stats",
+          "Single warehouse location",
+          "Up to 3 packers",
+        ],
+      },
+      {
         id: "starter",
         name: "Warehub Starter",
         price: 79,
@@ -1020,9 +1153,8 @@ function getBillingPlans() {
 async function createCheckoutSession(request, tenant, auth, env) {
   const b = await request.json().catch(() => ({}));
   const priceId = STRIPE_PRICES[b.plan];
-  if (!priceId) return err("Invalid plan — choose starter or pro");
+  if (!priceId) return err("Invalid plan — choose basic, starter or pro");
 
-  // Get or create Stripe customer
   let customerId = tenant.stripe_customer_id;
   if (!customerId) {
     const customer = await stripeRequest(
@@ -1100,7 +1232,6 @@ async function handleStripeWebhook(request, env) {
   const body = await request.text();
   const sigHeader = request.headers.get("Stripe-Signature") || "";
 
-  // Verify webhook signature
   const valid = await verifyStripeSignature(
     body,
     sigHeader,
@@ -1118,23 +1249,34 @@ async function handleStripeWebhook(request, env) {
       const sub = event.data.object;
       const custId = sub.customer;
       const status = sub.status;
-      // Determine plan from price ID
       const priceId = sub.items?.data?.[0]?.price?.id || "";
       const plan =
         priceId === STRIPE_PRICES.pro
           ? "pro"
           : priceId === STRIPE_PRICES.starter
           ? "starter"
+          : priceId === STRIPE_PRICES.basic
+          ? "basic"
           : "trial";
       const active = status === "active" || status === "trialing";
-      const expiry = active
-        ? null
-        : new Date(sub.current_period_end * 1000).toISOString();
+      // Always record the current period's end date — this is either the
+      // next renewal date (auto-renewing) or the date access cuts off
+      // (canceled). cancel_at_period_end tells the frontend which case it is.
+      const periodEnd = sub.current_period_end
+        ? new Date(sub.current_period_end * 1000).toISOString()
+        : null;
       await env.DB.prepare(
-        `UPDATE tenants SET plan = ?, plan_expires_at = ?, stripe_subscription_id = ?
+        `UPDATE tenants SET plan = ?, plan_expires_at = ?, stripe_subscription_id = ?,
+                cancel_at_period_end = ?
          WHERE stripe_customer_id = ?`
       )
-        .bind(active ? plan : "trial", expiry, sub.id, custId)
+        .bind(
+          active ? plan : "trial",
+          periodEnd,
+          sub.id,
+          sub.cancel_at_period_end ? 1 : 0,
+          custId
+        )
         .run();
     }
 
@@ -1176,10 +1318,8 @@ async function handleStripeWebhook(request, env) {
 
 // ══════════════════════════════════════════════════════════════════
 //  AI SELF-LEARNING SYSTEM
-//  Events → nightly Claude analysis → Insights surfaced in the app
 // ══════════════════════════════════════════════════════════════════
 
-// ── Log a user action event ───────────────────────────────────────
 async function logEvent(request, tenant, auth, env) {
   const b = await request.json().catch(() => ({}));
   const { eventType, entityType, entityId, payload } = b;
@@ -1203,7 +1343,6 @@ async function logEvent(request, tenant, auth, env) {
   return json({ ok: true });
 }
 
-// ── Get unread insights for this tenant ───────────────────────────
 async function getInsights(tenant, env) {
   const { results } = await env.DB.prepare(
     `SELECT * FROM insights
@@ -1218,7 +1357,6 @@ async function getInsights(tenant, env) {
   return json({ insights: results });
 }
 
-// ── Mark a single insight as read ────────────────────────────────
 async function markInsightRead(tenant, insightId, env) {
   await env.DB.prepare(
     `UPDATE insights SET is_read = 1
@@ -1236,7 +1374,6 @@ async function markInsightRead(tenant, insightId, env) {
 async function runNightlyAnalysis(env) {
   console.log("[Warehub AI] Starting nightly analysis");
 
-  // Get all active tenants
   const { results: tenants } = await env.DB.prepare(
     `SELECT id, name FROM tenants WHERE plan != 'suspended'`
   ).all();
@@ -1249,7 +1386,6 @@ async function runNightlyAnalysis(env) {
     }
   }
 
-  // Clean up insights older than 30 days
   await env.DB.prepare(
     `DELETE FROM insights WHERE created_at < unixepoch() - 2592000`
   ).run();
@@ -1262,7 +1398,6 @@ async function analyzeTenant(tenant, env) {
   const sevenDaysAgo = Math.floor(Date.now() / 1000) - 7 * 86400;
   const oneDayAgo = Math.floor(Date.now() / 1000) - 86400;
 
-  // ── Aggregate raw event counts ─────────────────────────────────
   const { results: eventCounts } = await env.DB.prepare(
     `SELECT event_type, COUNT(*) as cnt,
             MAX(occurred_at) as last_seen
@@ -1273,9 +1408,8 @@ async function analyzeTenant(tenant, env) {
     .bind(tenant.id, thirtyDaysAgo)
     .all();
 
-  if (!eventCounts.length) return; // no data yet, skip
+  if (!eventCounts.length) return;
 
-  // ── Daily activity breakdown (last 7 days) ─────────────────────
   const { results: dailyActivity } = await env.DB.prepare(
     `SELECT date(occurred_at, 'unixepoch') as day,
             event_type, COUNT(*) as cnt
@@ -1287,7 +1421,6 @@ async function analyzeTenant(tenant, env) {
     .bind(tenant.id, sevenDaysAgo)
     .all();
 
-  // ── Yesterday's summary ────────────────────────────────────────
   const { results: yesterdayEvents } = await env.DB.prepare(
     `SELECT event_type, COUNT(*) as cnt
      FROM events
@@ -1297,7 +1430,6 @@ async function analyzeTenant(tenant, env) {
     .bind(tenant.id, oneDayAgo)
     .all();
 
-  // ── Recent payloads for context ───────────────────────────────
   const { results: recentSamples } = await env.DB.prepare(
     `SELECT event_type, payload, occurred_at
      FROM events
@@ -1308,7 +1440,6 @@ async function analyzeTenant(tenant, env) {
     .bind(tenant.id, sevenDaysAgo)
     .all();
 
-  // ── Build context for Claude ───────────────────────────────────
   const context = {
     tenantName: tenant.name,
     analysisDate: new Date().toISOString().split("T")[0],
@@ -1318,7 +1449,6 @@ async function analyzeTenant(tenant, env) {
     recentSamples: recentSamples.slice(0, 20),
   };
 
-  // ── Call Claude Haiku for insight generation ───────────────────
   let aiInsights = [];
 
   if (env.ANTHROPIC_KEY) {
@@ -1352,7 +1482,6 @@ async function analyzeTenant(tenant, env) {
       if (resp.ok) {
         const data = await resp.json();
         const raw = data.content?.[0]?.text || "[]";
-        // Strip any accidental markdown fences
         const cleaned = raw
           .replace(/```json?/g, "")
           .replace(/```/g, "")
@@ -1365,13 +1494,10 @@ async function analyzeTenant(tenant, env) {
     }
   }
 
-  // ── Fallback: rule-based insights if Claude unavailable ────────
   if (!aiInsights.length) {
     aiInsights = generateRuleBasedInsights(context);
   }
 
-  // ── Write insights to D1 ──────────────────────────────────────
-  // Delete today's insights first (idempotent re-run)
   await env.DB.prepare(
     `DELETE FROM insights
      WHERE tenant_id = ? AND created_at > unixepoch() - 86400`
@@ -1379,7 +1505,7 @@ async function analyzeTenant(tenant, env) {
     .bind(tenant.id)
     .run();
 
-  const expiresAt = Math.floor(Date.now() / 1000) + 7 * 86400; // 7 day TTL
+  const expiresAt = Math.floor(Date.now() / 1000) + 7 * 86400;
 
   for (const ins of aiInsights.slice(0, 6)) {
     await env.DB.prepare(
@@ -1403,13 +1529,11 @@ async function analyzeTenant(tenant, env) {
   );
 }
 
-// ── Rule-based fallback (no AI key needed) ────────────────────────
 function generateRuleBasedInsights(ctx) {
   const insights = [];
   const counts = {};
   for (const e of ctx.last30Days) counts[e.event_type] = e.cnt;
 
-  // Orders per day trend
   const packed = counts["order_packed"] || 0;
   if (packed > 0) {
     const perDay = (packed / 30).toFixed(1);
@@ -1423,7 +1547,6 @@ function generateRuleBasedInsights(ctx) {
     });
   }
 
-  // Return rate
   const returns = counts["return_logged"] || 0;
   if (packed > 0 && returns > 0) {
     const rate = ((returns / packed) * 100).toFixed(1);
@@ -1440,7 +1563,6 @@ function generateRuleBasedInsights(ctx) {
     });
   }
 
-  // FBA activity
   const fba = counts["fba_created"] || 0;
   if (fba > 0) {
     insights.push({
@@ -1455,7 +1577,6 @@ function generateRuleBasedInsights(ctx) {
     });
   }
 
-  // Yesterday quiet
   if (!ctx.yesterday.length) {
     insights.push({
       insight_type: "digest",
