@@ -11,7 +11,7 @@ const CORS_HEADERS = {
   "Access-Control-Max-Age": "86400",
 };
 
-const CLERK_DOMAIN = "golden-magpie-54.clerk.accounts.dev";
+const CLERK_DOMAIN = "clerk.auth.wareplatform.com";
 const CLERK_JWKS = `https://${CLERK_DOMAIN}/.well-known/jwks.json`;
 
 // ── Helpers ───────────────────────────────────────────────────────
