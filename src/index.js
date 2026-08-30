@@ -245,6 +245,8 @@ async function handleRequest(request, env, ctx) {
   }
 
   if (path === "/api/ai" && method === "POST") {
+    const denied = requireFeature(tenant, "ai");
+    if (denied) return denied;
     return handleAiChat(request, tenant, env);
   }
 
@@ -262,6 +264,21 @@ async function handleRequest(request, env, ctx) {
   }
   if (path === "/api/billing/portal" && method === "POST") {
     return createBillingPortal(request, tenant, env);
+  }
+
+  // ── Reconciliation issues (owner only) ──────────────────────────
+  if (path === "/api/billing/issues" && method === "GET") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    const { results } = await env.DB.prepare(
+      `SELECT id, issue, d1_plan, stripe_status, detected_at
+       FROM reconciliation_issues
+       WHERE tenant_id = ? AND resolved = 0
+       ORDER BY detected_at DESC`
+    )
+      .bind(tenant.id)
+      .all();
+    return json({ issues: results });
   }
 
   // ── Team management (owner only) ───────────────────────────────
@@ -329,31 +346,43 @@ async function handleRequest(request, env, ctx) {
 
   // ── Vehicle ───────────────────────────────────────────────────
   if (path === "/api/vehicle/trips") {
+    const denied = requireFeature(tenant, "vehicle");
+    if (denied) return denied;
     if (method === "GET") return getTrips(tenant, env);
     if (method === "POST") return createTrip(request, tenant, env);
   }
   const tripMatch = path.match(/^\/api\/vehicle\/trips\/([^/]+)$/);
   if (tripMatch) {
+    const denied = requireFeature(tenant, "vehicle");
+    if (denied) return denied;
     if (method === "DELETE") return deleteTrip(tenant, tripMatch[1], env);
   }
 
   // ── Returns ───────────────────────────────────────────────────
   if (path === "/api/returns") {
+    const denied = requireFeature(tenant, "returns");
+    if (denied) return denied;
     if (method === "GET") return getReturns(tenant, env);
     if (method === "POST") return createReturn(request, tenant, env);
   }
   const returnMatch = path.match(/^\/api\/returns\/([^/]+)$/);
   if (returnMatch) {
+    const denied = requireFeature(tenant, "returns");
+    if (denied) return denied;
     if (method === "DELETE") return deleteReturn(tenant, returnMatch[1], env);
   }
 
   // ── FBA ───────────────────────────────────────────────────────
   if (path === "/api/fba") {
+    const denied = requireFeature(tenant, "fba");
+    if (denied) return denied;
     if (method === "GET") return getFBA(tenant, env);
     if (method === "POST") return createFBA(request, tenant, env);
   }
   const fbaMatch = path.match(/^\/api\/fba\/([^/]+)$/);
   if (fbaMatch) {
+    const denied = requireFeature(tenant, "fba");
+    if (denied) return denied;
     if (method === "DELETE") return deleteFBA(tenant, fbaMatch[1], env);
   }
 
@@ -441,6 +470,40 @@ async function handleRegister(request, env) {
       active: invite.plan === "starter" || invite.plan === "pro" || invite.plan === "basic",
       role: invite.role || "packer",
       existing: false,
+    });
+  }
+
+  // Same email already has an account under a DIFFERENT Clerk identity —
+  // this happens if someone re-signs-up after an auth widget hiccup, or
+  // after a dev→production Clerk migration issues a new user id for the
+  // same person. Attach to their existing tenant instead of silently
+  // spinning up a new empty duplicate company (which is exactly what
+  // happened before this check existed).
+  const emailMatch = await env.DB.prepare(
+    `SELECT u.tenant_id, u.role, t.plan, t.plan_expires_at
+     FROM users u JOIN tenants t ON t.id = u.tenant_id
+     WHERE lower(u.email) = lower(?)
+     ORDER BY u.id ASC LIMIT 1`
+  )
+    .bind(email)
+    .first();
+
+  if (emailMatch) {
+    const userId = uuid();
+    await env.DB.prepare(
+      `INSERT INTO users (id, tenant_id, clerk_user_id, email, name, role)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+      .bind(userId, emailMatch.tenant_id, clerkUserId, email, name, emailMatch.role)
+      .run();
+
+    return json({
+      tenantId: emailMatch.tenant_id,
+      plan: emailMatch.plan || "trial",
+      active: emailMatch.plan === "starter" || emailMatch.plan === "pro" || emailMatch.plan === "basic",
+      role: emailMatch.role,
+      existing: false,
+      merged: true,
     });
   }
 
@@ -581,6 +644,14 @@ async function syncPackers(request, tenant, env) {
   const list = b.packers || [];
   if (!list.length) return json({ ok: true, synced: 0 });
 
+  const limits = planLimitsFor(tenant);
+  const { count: existingCount } = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM packers WHERE tenant_id = ?`
+  )
+    .bind(tenant.id)
+    .first();
+  let currentCount = existingCount;
+
   for (const p of list) {
     const existing = await env.DB.prepare(
       `SELECT id FROM packers WHERE id = ? AND tenant_id = ?`
@@ -606,6 +677,11 @@ async function syncPackers(request, tenant, env) {
         )
         .run();
     } else {
+      if (currentCount >= limits.maxPackers) {
+        // Skip packers beyond the plan's limit rather than failing the
+        // whole sync batch — the rest of the list still gets synced.
+        continue;
+      }
       await env.DB.prepare(
         `INSERT INTO packers (id,tenant_id,name,color,pin,is_manager,online,
           daily_orders_date,daily_orders_completed)
@@ -623,6 +699,7 @@ async function syncPackers(request, tenant, env) {
           p.dailyOrdersCompleted || 0
         )
         .run();
+      currentCount++;
     }
 
     if (Array.isArray(p.shiftSessions)) {
@@ -659,6 +736,20 @@ async function syncPackers(request, tenant, env) {
 async function createPacker(request, tenant, env) {
   const b = await request.json().catch(() => ({}));
   if (!b.name) return err("name is required");
+
+  const limits = planLimitsFor(tenant);
+  const { count } = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM packers WHERE tenant_id = ?`
+  )
+    .bind(tenant.id)
+    .first();
+  if (count >= limits.maxPackers) {
+    return err(
+      `Your ${tenant.plan} plan allows up to ${limits.maxPackers} packers. Upgrade to add more.`,
+      403
+    );
+  }
+
   const id = uuid();
   await env.DB.prepare(
     `INSERT INTO packers (id, tenant_id, name, color, pin, is_manager)
@@ -1056,6 +1147,32 @@ const STRIPE_PRICES = {
   pro: "price_1U8aBXRrPnCkZ2DxHXEaZJhA",
 };
 
+// Single source of truth for what each plan actually includes — must stay
+// in sync with the feature lists on the landing page and billing.html.
+const PLAN_LIMITS = {
+  trial:   { maxPackers: 3,         vehicle: false, returns: false, fba: false, ai: false, multiLocation: false },
+  basic:   { maxPackers: 3,         vehicle: false, returns: false, fba: false, ai: false, multiLocation: false },
+  starter: { maxPackers: 10,        vehicle: true,  returns: true,  fba: true,  ai: false, multiLocation: false },
+  pro:     { maxPackers: Infinity,  vehicle: true,  returns: true,  fba: true,  ai: true,  multiLocation: true  },
+};
+
+function planLimitsFor(tenant) {
+  return PLAN_LIMITS[tenant.plan] || PLAN_LIMITS.trial;
+}
+
+// Returns an error Response if this feature isn't included in the tenant's
+// plan, otherwise null. Use: `const denied = requireFeature(tenant, 'fba'); if (denied) return denied;`
+function requireFeature(tenant, feature) {
+  const limits = planLimitsFor(tenant);
+  if (!limits[feature]) {
+    return err(
+      `This feature isn't included in your current plan (${tenant.plan}). Upgrade at app.wareplatform.com/billing.html to unlock it.`,
+      403
+    );
+  }
+  return null;
+}
+
 async function stripeRequest(path, method, body, env) {
   const resp = await fetch("https://api.stripe.com" + path, {
     method,
@@ -1239,9 +1356,23 @@ async function handleStripeWebhook(request, env) {
   );
   if (!valid) return err("Invalid webhook signature", 400);
 
+  let event;
   try {
-    const event = JSON.parse(body);
+    event = JSON.parse(body);
+  } catch (e) {
+    // Malformed payload — log and ack so Stripe doesn't retry forever on
+    // something that will never parse.
+    await env.DB.prepare(
+      `INSERT INTO billing_events (id, stripe_event, event_type, error)
+       VALUES (?, ?, ?, ?)`
+    )
+      .bind(uuid(), body.slice(0, 4000), "unknown", "JSON parse failed: " + e.message)
+      .run();
+    return json({ received: true });
+  }
 
+  let handlerError = null;
+  try {
     if (
       event.type === "customer.subscription.updated" ||
       event.type === "customer.subscription.created"
@@ -1265,7 +1396,7 @@ async function handleStripeWebhook(request, env) {
       const periodEnd = sub.current_period_end
         ? new Date(sub.current_period_end * 1000).toISOString()
         : null;
-      await env.DB.prepare(
+      const result = await env.DB.prepare(
         `UPDATE tenants SET plan = ?, plan_expires_at = ?, stripe_subscription_id = ?,
                 cancel_at_period_end = ?
          WHERE stripe_customer_id = ?`
@@ -1278,16 +1409,25 @@ async function handleStripeWebhook(request, env) {
           custId
         )
         .run();
+      // No tenant matched this customer ID — this event silently did
+      // nothing, which is exactly the class of bug that went undetected
+      // for days. Flag it instead of letting it disappear.
+      if (!result.meta || result.meta.changes === 0) {
+        handlerError = `No tenant found with stripe_customer_id=${custId}`;
+      }
     }
 
     if (event.type === "customer.subscription.deleted") {
       const custId = event.data.object.customer;
-      await env.DB.prepare(
+      const result = await env.DB.prepare(
         `UPDATE tenants SET plan = 'trial', plan_expires_at = datetime('now')
          WHERE stripe_customer_id = ?`
       )
         .bind(custId)
         .run();
+      if (!result.meta || result.meta.changes === 0) {
+        handlerError = `No tenant found with stripe_customer_id=${custId}`;
+      }
     }
 
     if (event.type === "checkout.session.completed") {
@@ -1296,23 +1436,32 @@ async function handleStripeWebhook(request, env) {
         session.subscription_data?.metadata?.tenant_id ||
         session.metadata?.tenant_id;
       if (tenantId && session.customer) {
-        await env.DB.prepare(
+        const result = await env.DB.prepare(
           `UPDATE tenants SET stripe_customer_id = ? WHERE id = ?`
         )
           .bind(session.customer, tenantId)
           .run();
+        if (!result.meta || result.meta.changes === 0) {
+          handlerError = `No tenant found with id=${tenantId}`;
+        }
+      } else {
+        handlerError = "checkout.session.completed missing tenant_id metadata";
       }
     }
-
-    await env.DB.prepare(
-      `INSERT INTO billing_events (id, stripe_event, event_type)
-       VALUES (?, ?, ?)`
-    )
-      .bind(uuid(), body.slice(0, 4000), event.type || "unknown")
-      .run();
   } catch (e) {
-    console.error("[Warehub webhook]", e.message);
+    console.error("[Warehub webhook]", event.type, e.message);
+    handlerError = e.message;
   }
+
+  // Always record what happened — success or failure — so nothing goes
+  // silently missing the way it did before.
+  await env.DB.prepare(
+    `INSERT INTO billing_events (id, stripe_event, event_type, error)
+     VALUES (?, ?, ?, ?)`
+  )
+    .bind(uuid(), body.slice(0, 4000), event.type || "unknown", handlerError)
+    .run();
+
   return json({ received: true });
 }
 
@@ -1391,6 +1540,128 @@ async function runNightlyAnalysis(env) {
   ).run();
 
   console.log("[Warehub AI] Nightly analysis complete");
+
+  try {
+    await reconcileBilling(env);
+  } catch (e) {
+    console.error("[Warehub Reconcile] Failed:", e.message);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  NIGHTLY RECONCILIATION — catches drift between D1 and Stripe that
+//  a missed/failed webhook would otherwise leave undetected
+// ══════════════════════════════════════════════════════════════════
+
+async function reconcileBilling(env) {
+  console.log("[Warehub Reconcile] Starting billing reconciliation");
+
+  const { results: tenants } = await env.DB.prepare(
+    `SELECT id, name, plan, stripe_customer_id, stripe_subscription_id,
+            plan_expires_at, cancel_at_period_end
+     FROM tenants
+     WHERE stripe_customer_id IS NOT NULL`
+  ).all();
+
+  let issues = 0;
+
+  for (const tenant of tenants) {
+    try {
+      // Ask Stripe what's actually true for this customer, independent of
+      // whatever our own webhook history says.
+      const subs = await stripeRequest(
+        `/v1/subscriptions?customer=${tenant.stripe_customer_id}&status=all&limit=10`,
+        "GET",
+        null,
+        env
+      );
+      if (subs.error) {
+        await flagIssue(env, tenant.id, `Stripe API error: ${subs.error.message}`, tenant.plan, null);
+        issues++;
+        continue;
+      }
+
+      const activeSubs = (subs.data || []).filter(
+        (s) => s.status === "active" || s.status === "trialing"
+      );
+
+      if (tenant.plan !== "trial" && activeSubs.length === 0) {
+        // D1 thinks this tenant is paying; Stripe says no active subscription exists.
+        await flagIssue(
+          env,
+          tenant.id,
+          "Tenant marked as paid in D1 but has no active Stripe subscription",
+          tenant.plan,
+          "none"
+        );
+        issues++;
+      } else if (activeSubs.length > 1) {
+        // Seen this exact scenario today — duplicate subscriptions racing
+        // each other for which one "wins" in D1.
+        await flagIssue(
+          env,
+          tenant.id,
+          `Tenant has ${activeSubs.length} simultaneous active Stripe subscriptions`,
+          tenant.plan,
+          activeSubs.map((s) => s.id).join(",")
+        );
+        issues++;
+      } else if (activeSubs.length === 1) {
+        const sub = activeSubs[0];
+        const priceId = sub.items?.data?.[0]?.price?.id || "";
+        const stripePlan =
+          priceId === STRIPE_PRICES.pro
+            ? "pro"
+            : priceId === STRIPE_PRICES.starter
+            ? "starter"
+            : priceId === STRIPE_PRICES.basic
+            ? "basic"
+            : "unknown";
+        if (stripePlan !== tenant.plan) {
+          await flagIssue(
+            env,
+            tenant.id,
+            `D1 plan (${tenant.plan}) does not match Stripe's active subscription plan (${stripePlan})`,
+            tenant.plan,
+            sub.status
+          );
+          issues++;
+        }
+        if (tenant.stripe_subscription_id !== sub.id) {
+          await flagIssue(
+            env,
+            tenant.id,
+            `D1 stripe_subscription_id is stale or missing (Stripe has ${sub.id})`,
+            tenant.plan,
+            sub.status
+          );
+          issues++;
+        }
+      }
+    } catch (e) {
+      console.error(`[Warehub Reconcile] Failed for tenant ${tenant.id}:`, e.message);
+    }
+  }
+
+  console.log(`[Warehub Reconcile] Complete — ${issues} issue(s) flagged`);
+}
+
+async function flagIssue(env, tenantId, issue, d1Plan, stripeStatus) {
+  // Avoid re-flagging the exact same unresolved issue every night.
+  const existing = await env.DB.prepare(
+    `SELECT id FROM reconciliation_issues
+     WHERE tenant_id = ? AND issue = ? AND resolved = 0`
+  )
+    .bind(tenantId, issue)
+    .first();
+  if (existing) return;
+
+  await env.DB.prepare(
+    `INSERT INTO reconciliation_issues (id, tenant_id, issue, d1_plan, stripe_status)
+     VALUES (?, ?, ?, ?, ?)`
+  )
+    .bind(uuid(), tenantId, issue, d1Plan, stripeStatus)
+    .run();
 }
 
 async function analyzeTenant(tenant, env) {
