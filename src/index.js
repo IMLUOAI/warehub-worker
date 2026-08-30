@@ -135,6 +135,165 @@ function requireOwner(auth) {
   return null;
 }
 
+// ── API key auth (for third-party integrations, e.g. an ERP) ──────
+// Separate from Clerk JWT auth — machine clients authenticate with a
+// long-lived key instead of a human session token.
+
+function generateApiKey() {
+  const raw = "wh_live_" + Array.from(crypto.getRandomValues(new Uint8Array(24)))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return raw;
+}
+
+async function hashApiKey(key) {
+  const data = new TextEncoder().encode(key);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// Returns { tenant } for a valid, non-revoked API key, or null.
+async function resolveApiKeyAuth(request, env) {
+  const keyHeader = request.headers.get("X-API-Key") || "";
+  if (!keyHeader.startsWith("wh_live_")) return null;
+
+  const hash = await hashApiKey(keyHeader);
+  const row = await env.DB.prepare(
+    `SELECT ak.id as keyId, ak.tenant_id, t.id as tenantId, t.name as tenantName,
+            t.plan, t.plan_expires_at, t.cancel_at_period_end
+     FROM api_keys ak
+     JOIN tenants t ON t.id = ak.tenant_id
+     WHERE ak.key_hash = ? AND ak.revoked = 0`
+  )
+    .bind(hash)
+    .first();
+
+  if (!row) return null;
+
+  // Fire-and-forget last-used timestamp — don't block the request on it.
+  env.DB.prepare(`UPDATE api_keys SET last_used_at = unixepoch() WHERE id = ?`)
+    .bind(row.keyId)
+    .run()
+    .catch(() => {});
+
+  return {
+    apiKeyId: row.keyId,
+    tenant: {
+      id: row.tenantId,
+      name: row.tenantName,
+      plan: row.plan,
+      plan_expires_at: row.plan_expires_at,
+      cancel_at_period_end: !!row.cancel_at_period_end,
+    },
+  };
+}
+
+// ── Outbound webhooks — fire events to a tenant's registered ERP/
+// integration endpoint in real time as things happen in the app.
+
+async function fireWebhookEvent(tenantId, eventType, payload, env) {
+  const { results: endpoints } = await env.DB.prepare(
+    `SELECT id, url, secret, events FROM webhook_endpoints
+     WHERE tenant_id = ? AND active = 1`
+  )
+    .bind(tenantId)
+    .all();
+
+  for (const ep of endpoints) {
+    const subscribedEvents = (ep.events || "").split(",").map((s) => s.trim());
+    if (!subscribedEvents.includes(eventType) && !subscribedEvents.includes("*")) continue;
+
+    const body = JSON.stringify({ type: eventType, data: payload, timestamp: Date.now() });
+    try {
+      const sig = await signWebhookBody(body, ep.secret);
+      const resp = await fetch(ep.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Warehub-Signature": sig,
+        },
+        body,
+      });
+      await env.DB.prepare(
+        `UPDATE webhook_endpoints SET last_triggered_at = unixepoch(), last_status = ? WHERE id = ?`
+      )
+        .bind(resp.status, ep.id)
+        .run();
+    } catch (e) {
+      console.error(`[Warehub Webhook] Failed to deliver to ${ep.url}:`, e.message);
+      await env.DB.prepare(
+        `UPDATE webhook_endpoints SET last_triggered_at = unixepoch(), last_status = 0 WHERE id = ?`
+      )
+        .bind(ep.id)
+        .run()
+        .catch(() => {});
+    }
+  }
+}
+
+async function signWebhookBody(body, secret) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function createApiKey(request, tenant, auth, env) {
+  const b = await request.json().catch(() => ({}));
+  const name = (b.name || "").trim() || "Unnamed key";
+
+  const rawKey = generateApiKey();
+  const hash = await hashApiKey(rawKey);
+  const prefix = rawKey.slice(0, 14) + "…"; // e.g. "wh_live_a1b2c3…" for display
+
+  const id = uuid();
+  await env.DB.prepare(
+    `INSERT INTO api_keys (id, tenant_id, name, key_hash, key_prefix, created_by)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(id, tenant.id, name, hash, prefix, auth.userId)
+    .run();
+
+  // The raw key is only ever shown this one time — it isn't recoverable
+  // from storage afterward (only its hash is kept).
+  return json({ id, key: rawKey, prefix }, 201);
+}
+
+async function createWebhookEndpoint(request, tenant, env) {
+  const b = await request.json().catch(() => ({}));
+  const url = (b.url || "").trim();
+  const events = Array.isArray(b.events) && b.events.length ? b.events.join(",") : "*";
+  if (!url || !url.startsWith("https://")) {
+    return err("A valid https:// URL is required");
+  }
+
+  const secretBytes = crypto.getRandomValues(new Uint8Array(24));
+  const secret = Array.from(secretBytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  const id = uuid();
+  await env.DB.prepare(
+    `INSERT INTO webhook_endpoints (id, tenant_id, url, secret, events)
+     VALUES (?, ?, ?, ?, ?)`
+  )
+    .bind(id, tenant.id, url, secret, events)
+    .run();
+
+  // Secret is shown once, same pattern as the API key itself — needed so
+  // the ERP side can verify the X-Warehub-Signature header on delivery.
+  return json({ id, url, secret, events }, 201);
+}
+
 // ── Interactive AI chat/actions proxy ────────────────────────────
 async function handleAiChat(request, tenant, env) {
   if (!env.ANTHROPIC_KEY) return err("AI is not configured for this deployment.", 503);
@@ -219,6 +378,27 @@ async function handleRequest(request, env, ctx) {
     return getBillingPlans();
   }
 
+  // ── API key routes (third-party integrations, e.g. an ERP) ──────
+  // Separate auth path from the Clerk-session routes below — machine
+  // clients present X-API-Key instead of a Bearer JWT.
+  if (path.startsWith("/api/v1/")) {
+    const apiAuth = await resolveApiKeyAuth(request, env);
+    if (!apiAuth) return err("Invalid or missing API key", 401);
+    const v1Tenant = apiAuth.tenant;
+
+    if (path === "/api/v1/orders" && method === "GET") {
+      return v1GetOrders(request, v1Tenant, env);
+    }
+    if (path === "/api/v1/orders" && method === "POST") {
+      return v1CreateOrders(request, v1Tenant, env);
+    }
+    const v1OrderMatch = path.match(/^\/api\/v1\/orders\/([^/]+)$/);
+    if (v1OrderMatch && method === "PATCH") {
+      return v1UpdateOrder(request, v1Tenant, v1OrderMatch[1], env);
+    }
+    return err("Not found", 404);
+  }
+
   // ── Authenticated routes ───────────────────────────────────────
   const auth = await resolveAuth(request, env);
   if (!auth) return err("Unauthorized", 401);
@@ -279,6 +459,62 @@ async function handleRequest(request, env, ctx) {
       .bind(tenant.id)
       .all();
     return json({ issues: results });
+  }
+
+  // ── API integrations (owner only) — keys + outbound webhooks ────
+  if (path === "/api/integrations/keys" && method === "GET") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    const { results } = await env.DB.prepare(
+      `SELECT id, name, key_prefix, created_at, last_used_at, revoked
+       FROM api_keys WHERE tenant_id = ? AND revoked = 0 ORDER BY created_at DESC`
+    )
+      .bind(tenant.id)
+      .all();
+    return json({ keys: results });
+  }
+  if (path === "/api/integrations/keys" && method === "POST") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    return createApiKey(request, tenant, auth, env);
+  }
+  const keyRevokeMatch = path.match(/^\/api\/integrations\/keys\/([^/]+)$/);
+  if (keyRevokeMatch && method === "DELETE") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    await env.DB.prepare(
+      `UPDATE api_keys SET revoked = 1 WHERE id = ? AND tenant_id = ?`
+    )
+      .bind(keyRevokeMatch[1], tenant.id)
+      .run();
+    return json({ ok: true });
+  }
+  if (path === "/api/integrations/webhooks" && method === "GET") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    const { results } = await env.DB.prepare(
+      `SELECT id, url, events, active, created_at, last_triggered_at, last_status
+       FROM webhook_endpoints WHERE tenant_id = ? ORDER BY created_at DESC`
+    )
+      .bind(tenant.id)
+      .all();
+    return json({ webhooks: results });
+  }
+  if (path === "/api/integrations/webhooks" && method === "POST") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    return createWebhookEndpoint(request, tenant, env);
+  }
+  const webhookDeleteMatch = path.match(/^\/api\/integrations\/webhooks\/([^/]+)$/);
+  if (webhookDeleteMatch && method === "DELETE") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    await env.DB.prepare(
+      `DELETE FROM webhook_endpoints WHERE id = ? AND tenant_id = ?`
+    )
+      .bind(webhookDeleteMatch[1], tenant.id)
+      .run();
+    return json({ ok: true });
   }
 
   // ── Team management (owner only) ───────────────────────────────
@@ -874,6 +1110,7 @@ async function createOrders(request, tenant, env) {
   if (!Array.isArray(b.orders) || !b.orders.length)
     return err("orders array required");
   let inserted = 0;
+  const insertedOrders = [];
   for (const o of b.orders) {
     const id = uuid();
     await env.DB.prepare(
@@ -892,7 +1129,11 @@ async function createOrders(request, tenant, env) {
           .run();
       }
     }
+    insertedOrders.push({ id, tracking: o.tracking, carrier: o.carrier || "Unknown" });
     inserted++;
+  }
+  if (insertedOrders.length) {
+    fireWebhookEvent(tenant.id, "order.created", { orders: insertedOrders }, env).catch(() => {});
   }
   return json({ inserted }, 201);
 }
@@ -921,7 +1162,66 @@ async function updateOrder(request, tenant, orderId, env) {
   )
     .bind(...values)
     .run();
+
+  if (b.status === "done") {
+    const order = await env.DB.prepare(
+      `SELECT id, tracking, carrier, packed_by, completed_at FROM orders WHERE id = ? AND tenant_id = ?`
+    )
+      .bind(orderId, tenant.id)
+      .first();
+    if (order) {
+      fireWebhookEvent(tenant.id, "order.completed", order, env).catch(() => {});
+    }
+  }
+
   return json({ ok: true });
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  API v1 — third-party integration endpoints (API key auth)
+// ══════════════════════════════════════════════════════════════════
+
+async function v1GetOrders(request, tenant, env) {
+  const url = new URL(request.url);
+  const since = url.searchParams.get("since"); // ISO timestamp, optional
+  const status = url.searchParams.get("status"); // 'pending' | 'done', optional
+
+  let query = `SELECT * FROM orders WHERE tenant_id = ?`;
+  const params = [tenant.id];
+  if (since) {
+    query += ` AND imported_at >= ?`;
+    params.push(since);
+  }
+  if (status) {
+    query += ` AND status = ?`;
+    params.push(status);
+  }
+  query += ` ORDER BY imported_at DESC LIMIT 500`;
+
+  const { results: orders } = await env.DB.prepare(query).bind(...params).all();
+  const { results: skus } = await env.DB.prepare(
+    `SELECT * FROM order_skus WHERE tenant_id = ?`
+  )
+    .bind(tenant.id)
+    .all();
+  const skuMap = {};
+  for (const s of skus) {
+    if (!skuMap[s.order_id]) skuMap[s.order_id] = [];
+    skuMap[s.order_id].push({ sku: s.sku, qty: s.qty });
+  }
+  return json({
+    orders: orders.map((o) => ({ ...o, skus: skuMap[o.id] || [] })),
+  });
+}
+
+async function v1CreateOrders(request, tenant, env) {
+  // Same shape/behavior as the browser-facing create — an ERP pushing new
+  // orders in should look identical to importing a carrier PDF.
+  return createOrders(request, tenant, env);
+}
+
+async function v1UpdateOrder(request, tenant, orderId, env) {
+  return updateOrder(request, tenant, orderId, env);
 }
 
 async function deleteOrder(tenant, orderId, env) {
