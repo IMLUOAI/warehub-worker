@@ -103,7 +103,8 @@ async function resolveAuth(request, env) {
   const row = await env.DB.prepare(
     `SELECT u.id as userId, u.role, u.name as userName, u.email as userEmail,
             t.id as tenantId, t.name as tenantName, t.plan, t.plan_expires_at,
-            t.stripe_customer_id, t.stripe_subscription_id, t.cancel_at_period_end
+            t.stripe_customer_id, t.stripe_subscription_id, t.cancel_at_period_end,
+            t.trial_started_at
      FROM users u
      JOIN tenants t ON t.id = u.tenant_id
      WHERE u.clerk_user_id = ?`
@@ -124,6 +125,7 @@ async function resolveAuth(request, env) {
       plan: row.plan,
       plan_expires_at: row.plan_expires_at,
       cancel_at_period_end: !!row.cancel_at_period_end,
+      trial_started_at: row.trial_started_at || null,
       stripe_customer_id: row.stripe_customer_id || null,
       stripe_subscription_id: row.stripe_subscription_id || null,
     },
@@ -133,6 +135,29 @@ async function resolveAuth(request, env) {
 function requireOwner(auth) {
   if (auth.role !== "owner") return err("Only the account owner can do this", 403);
   return null;
+}
+
+const TRIAL_DAYS = 14;
+
+// Single source of truth for "does this tenant currently have access" —
+// a paid plan always counts; a trial counts only within its first 14 days.
+// Previously this was computed 4 separate times, none of which ever
+// counted 'trial' as active at all — meaning the advertised 14-day free
+// trial never actually worked.
+function tenantIsActive(tenant) {
+  if (tenant.plan === "starter" || tenant.plan === "pro" || tenant.plan === "basic") {
+    return true;
+  }
+  if (tenant.plan === "trial" && tenant.trial_started_at) {
+    const trialEnd = tenant.trial_started_at + TRIAL_DAYS * 86400;
+    return Math.floor(Date.now() / 1000) < trialEnd;
+  }
+  return false;
+}
+
+function trialEndsAt(tenant) {
+  if (!tenant.trial_started_at) return null;
+  return new Date((tenant.trial_started_at + TRIAL_DAYS * 86400) * 1000).toISOString();
 }
 
 // ── API key auth (for third-party integrations, e.g. an ERP) ──────
@@ -419,6 +444,13 @@ async function handleRequest(request, env, ctx) {
       402
     );
   }
+  // A trial tenant whose 14 days have run out and never subscribed.
+  if (tenant.plan === "trial" && !tenantIsActive(tenant)) {
+    return err(
+      "Your free trial has ended — choose a plan at app.wareplatform.com/billing.html to continue",
+      402
+    );
+  }
 
   if (path === "/api/health") {
     return json({ status: "ok", tenant: tenant.name, plan: tenant.plan });
@@ -431,12 +463,12 @@ async function handleRequest(request, env, ctx) {
   }
 
   if (path === "/api/billing/status" && method === "GET") {
-    const active = tenant.plan === "starter" || tenant.plan === "pro" || tenant.plan === "basic";
     return json({
       plan: tenant.plan || "trial",
-      active,
+      active: tenantIsActive(tenant),
       expiresAt: tenant.plan_expires_at || null,
       cancelAtPeriodEnd: tenant.cancel_at_period_end || false,
+      trialEndsAt: tenant.plan === "trial" ? trialEndsAt(tenant) : null,
     });
   }
   if (path === "/api/billing/checkout" && method === "POST") {
@@ -660,7 +692,7 @@ async function handleRegister(request, env) {
 
   // Already-registered user (any role) — just return their tenant/role
   const existing = await env.DB.prepare(
-    `SELECT u.tenant_id, u.role, t.plan, t.plan_expires_at
+    `SELECT u.tenant_id, u.role, t.plan, t.plan_expires_at, t.trial_started_at
      FROM users u JOIN tenants t ON t.id = u.tenant_id
      WHERE u.clerk_user_id = ?`
   )
@@ -670,8 +702,9 @@ async function handleRegister(request, env) {
     return json({
       tenantId: existing.tenant_id,
       plan: existing.plan || "trial",
-      active: existing.plan === "starter" || existing.plan === "pro" || existing.plan === "basic",
+      active: tenantIsActive(existing),
       role: existing.role,
+      trialEndsAt: existing.plan === "trial" ? trialEndsAt(existing) : null,
       existing: true,
     });
   }
@@ -679,7 +712,7 @@ async function handleRegister(request, env) {
   // Check for a pending invite matching this email — join that tenant
   // instead of creating a brand new one.
   const invite = await env.DB.prepare(
-    `SELECT i.id as inviteId, i.tenant_id, i.role, t.plan, t.plan_expires_at
+    `SELECT i.id as inviteId, i.tenant_id, i.role, t.plan, t.plan_expires_at, t.trial_started_at
      FROM invites i JOIN tenants t ON t.id = i.tenant_id
      WHERE lower(i.email) = lower(?) AND i.accepted_at IS NULL`
   )
@@ -703,8 +736,9 @@ async function handleRegister(request, env) {
     return json({
       tenantId: invite.tenant_id,
       plan: invite.plan || "trial",
-      active: invite.plan === "starter" || invite.plan === "pro" || invite.plan === "basic",
+      active: tenantIsActive(invite),
       role: invite.role || "packer",
+      trialEndsAt: invite.plan === "trial" ? trialEndsAt(invite) : null,
       existing: false,
     });
   }
@@ -716,7 +750,7 @@ async function handleRegister(request, env) {
   // spinning up a new empty duplicate company (which is exactly what
   // happened before this check existed).
   const emailMatch = await env.DB.prepare(
-    `SELECT u.tenant_id, u.role, t.plan, t.plan_expires_at
+    `SELECT u.tenant_id, u.role, t.plan, t.plan_expires_at, t.trial_started_at
      FROM users u JOIN tenants t ON t.id = u.tenant_id
      WHERE lower(u.email) = lower(?)
      ORDER BY u.id ASC LIMIT 1`
@@ -736,21 +770,25 @@ async function handleRegister(request, env) {
     return json({
       tenantId: emailMatch.tenant_id,
       plan: emailMatch.plan || "trial",
-      active: emailMatch.plan === "starter" || emailMatch.plan === "pro" || emailMatch.plan === "basic",
+      active: tenantIsActive(emailMatch),
       role: emailMatch.role,
+      trialEndsAt: emailMatch.plan === "trial" ? trialEndsAt(emailMatch) : null,
       existing: false,
       merged: true,
     });
   }
 
-  // No invite — create a brand-new tenant, this user becomes the owner
+  // No invite — create a brand-new tenant, this user becomes the owner.
+  // Start the 14-day free trial clock right now — this is the fix for the
+  // trial never actually working before.
   const tenantId = uuid();
   const userId = uuid();
+  const trialStartedAt = Math.floor(Date.now() / 1000);
 
   await env.DB.prepare(
-    `INSERT INTO tenants (id, name, plan) VALUES (?, ?, 'trial')`
+    `INSERT INTO tenants (id, name, plan, trial_started_at) VALUES (?, ?, 'trial', ?)`
   )
-    .bind(tenantId, name)
+    .bind(tenantId, name, trialStartedAt)
     .run();
 
   await env.DB.prepare(
@@ -760,7 +798,14 @@ async function handleRegister(request, env) {
     .bind(userId, tenantId, clerkUserId, email, name)
     .run();
 
-  return json({ tenantId, userId, plan: "trial", active: false, role: "owner" }, 201);
+  return json({
+    tenantId,
+    userId,
+    plan: "trial",
+    active: true,
+    role: "owner",
+    trialEndsAt: trialEndsAt({ trial_started_at: trialStartedAt }),
+  }, 201);
 }
 
 // ── Team management ─────────────────────────────────────────────
