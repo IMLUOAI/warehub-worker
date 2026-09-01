@@ -654,6 +654,21 @@ async function handleRequest(request, env, ctx) {
     if (method === "DELETE") return deleteFBA(tenant, fbaMatch[1], env);
   }
 
+  // ── FBA Outbound grid (flat, spreadsheet-style) ─────────────────
+  if (path === "/api/fba-grid") {
+    const denied = requireFeature(tenant, "fba");
+    if (denied) return denied;
+    if (method === "GET") return getFbaGrid(tenant, env);
+    if (method === "POST") return createFbaGridRow(request, tenant, env);
+  }
+  const fbaGridMatch = path.match(/^\/api\/fba-grid\/([^/]+)$/);
+  if (fbaGridMatch) {
+    const denied = requireFeature(tenant, "fba");
+    if (denied) return denied;
+    if (method === "PATCH") return updateFbaGridRow(request, tenant, fbaGridMatch[1], env);
+    if (method === "DELETE") return deleteFbaGridRow(tenant, fbaGridMatch[1], env);
+  }
+
   // ── Settings ──────────────────────────────────────────────────
   if (path === "/api/settings") {
     if (method === "GET") return getSettings(tenant, env);
@@ -1448,6 +1463,78 @@ async function deleteFBA(tenant, fbaId, env) {
     `DELETE FROM fba_shipments WHERE id = ? AND tenant_id = ?`
   )
     .bind(fbaId, tenant.id)
+    .run();
+  return json({ ok: true });
+}
+
+// ── FBA Outbound grid (flat, spreadsheet-style row entry) ──────────
+
+async function getFbaGrid(tenant, env) {
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM fba_outbound_items WHERE tenant_id = ? ORDER BY created_at DESC`
+  )
+    .bind(tenant.id)
+    .all();
+  return json({ rows: results });
+}
+
+async function createFbaGridRow(request, tenant, env) {
+  const b = await request.json().catch(() => ({}));
+  const id = uuid();
+  await env.DB.prepare(
+    `INSERT INTO fba_outbound_items
+       (id, tenant_id, ship_date, shipment_id, fulfillment_center, sku, qty,
+        size, weight, carrier, tracking, boxes, submitted_by, notes)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      id,
+      tenant.id,
+      b.ship_date || new Date().toISOString().slice(0, 10),
+      b.shipment_id || "",
+      b.fulfillment_center || "",
+      b.sku || "",
+      b.qty || 0,
+      b.size || "",
+      b.weight || null,
+      b.carrier || "",
+      b.tracking || "",
+      b.boxes || null,
+      b.submitted_by || "",
+      b.notes || ""
+    )
+    .run();
+  return json({ id }, 201);
+}
+
+async function updateFbaGridRow(request, tenant, rowId, env) {
+  const b = await request.json().catch(() => ({}));
+  const allowed = [
+    "ship_date", "shipment_id", "fulfillment_center", "sku", "qty",
+    "size", "weight", "carrier", "tracking", "boxes", "submitted_by", "notes",
+  ];
+  const fields = [], values = [];
+  for (const key of allowed) {
+    if (key in b) {
+      fields.push(`${key} = ?`);
+      values.push(b[key]);
+    }
+  }
+  if (!fields.length) return err("Nothing to update");
+  values.push(rowId, tenant.id);
+  await env.DB.prepare(
+    `UPDATE fba_outbound_items SET ${fields.join(", ")} WHERE id = ? AND tenant_id = ?`
+  )
+    .bind(...values)
+    .run();
+  return json({ ok: true });
+}
+
+async function deleteFbaGridRow(tenant, rowId, env) {
+  await env.DB.prepare(
+    `DELETE FROM fba_outbound_items WHERE id = ? AND tenant_id = ?`
+  )
+    .bind(rowId, tenant.id)
     .run();
   return json({ ok: true });
 }
