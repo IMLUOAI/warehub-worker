@@ -493,6 +493,16 @@ async function handleRequest(request, env, ctx) {
     return json({ issues: results });
   }
 
+  // ── xlwms integration (owner only) — pull outbound orders ───────
+  if (path === "/api/integrations/xlwms/sync" && method === "POST") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    const b = await request.json().catch(() => ({}));
+    const result = await xlwmsSyncOrders(tenant, env, b);
+    if (result.error) return err(result.error, 502);
+    return json(result);
+  }
+
   // ── API integrations (owner only) — keys + outbound webhooks ────
   if (path === "/api/integrations/keys" && method === "GET") {
     const denied = requireOwner(auth);
@@ -1572,6 +1582,133 @@ async function saveSettings(request, tenant, env) {
 }
 
 // ── Stripe helpers ────────────────────────────────────────────────
+
+// ══════════════════════════════════════════════════════════════════
+//  xlwms (领星WMS) Integration — pull outbound orders/labels
+//  Credentials come from env.XLWMS_APP_KEY / env.XLWMS_APP_SECRET
+//  (set via `wrangler secret put`, never stored in source or DB).
+// ══════════════════════════════════════════════════════════════════
+
+// Recursively sorts object keys alphabetically — JS's default key order
+// isn't guaranteed to match "字典升序排序" (dictionary ascending order),
+// so this makes it explicit before JSON.stringify.
+function sortKeysDeep(value) {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (value && typeof value === "object") {
+    const sorted = {};
+    for (const key of Object.keys(value).sort()) {
+      sorted[key] = sortKeysDeep(value[key]);
+    }
+    return sorted;
+  }
+  return value;
+}
+
+async function xlwmsSign(dataObj, appKey, appSecret, timestamp) {
+  const dataStr = JSON.stringify(sortKeysDeep(dataObj));
+  const concatStr = appKey + dataStr + timestamp;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(appSecret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sigBuf = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(concatStr));
+  return Array.from(new Uint8Array(sigBuf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function xlwmsRequest(path, dataObj, env) {
+  if (!env.XLWMS_APP_KEY || !env.XLWMS_APP_SECRET) {
+    return { error: { message: "xlwms credentials not configured on this Worker" } };
+  }
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const sign = await xlwmsSign(dataObj, env.XLWMS_APP_KEY, env.XLWMS_APP_SECRET, timestamp);
+
+  const resp = await fetch("https://api.xlwms.com" + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      appKey: env.XLWMS_APP_KEY,
+      timestamp,
+      sign,
+      data: dataObj,
+    }),
+  });
+  return resp.json();
+}
+
+// Pulls recent outbound orders from xlwms and imports them as pending
+// orders in D1 — same shape as a manual PDF label import, just automated.
+async function xlwmsSyncOrders(tenant, env, opts) {
+  opts = opts || {};
+  const pageSize = 100;
+  let page = 1;
+  let imported = 0;
+  let totalPages = 1;
+
+  do {
+    const result = await xlwmsRequest(
+      "/openapi/v2/order/delivery/page",
+      {
+        current: page,
+        size: pageSize,
+        timeType: "createTime",
+        startTime: opts.startTime || new Date(Date.now() - 24 * 3600000).toISOString().slice(0, 19).replace("T", " "),
+        endTime: opts.endTime || new Date().toISOString().slice(0, 19).replace("T", " "),
+      },
+      env
+    );
+
+    if (!result.success) {
+      return { error: result.msg || "xlwms request failed", code: result.code };
+    }
+
+    const records = (result.data && result.data.records) || [];
+    totalPages = (result.data && result.data.pages) || 1;
+
+    for (const rec of records) {
+      // Avoid re-importing the same order on repeated syncs.
+      const existing = await env.DB.prepare(
+        `SELECT id FROM orders WHERE tenant_id = ? AND tracking = ?`
+      )
+        .bind(tenant.id, rec.expressNo || rec.sourceNo)
+        .first();
+      if (existing) continue;
+
+      const id = uuid();
+      await env.DB.prepare(
+        `INSERT INTO orders (id, tenant_id, tracking, carrier, shelf, status)
+         VALUES (?, ?, ?, ?, ?, 'pending')`
+      )
+        .bind(
+          id,
+          tenant.id,
+          rec.expressNo || rec.sourceNo || "",
+          rec.logisticsChannelName || rec.logisticsChannel || "Unknown",
+          null
+        )
+        .run();
+
+      if (Array.isArray(rec.productList)) {
+        for (const p of rec.productList) {
+          await env.DB.prepare(
+            `INSERT INTO order_skus (id, tenant_id, order_id, sku, qty)
+             VALUES (?, ?, ?, ?, ?)`
+          )
+            .bind(uuid(), tenant.id, id, p.productSku || "", p.qty || 1)
+            .run();
+        }
+      }
+      imported++;
+    }
+    page++;
+  } while (page <= totalPages && page <= 20); // safety cap: 20 pages per sync
+
+  return { imported };
+}
 
 const STRIPE_PRICES = {
   basic: "price_1U8a4YRrPnCkZ2Dx2A94sTLI",
