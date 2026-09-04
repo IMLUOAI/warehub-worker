@@ -499,7 +499,7 @@ async function handleRequest(request, env, ctx) {
     if (denied) return denied;
     const b = await request.json().catch(() => ({}));
     const result = await xlwmsSyncOrders(tenant, env, b);
-    if (result.error) return err(result.error, 502);
+    if (result.error) return json({ error: result.error, code: result.code, raw: result.raw }, 502);
     return json(result);
   }
 
@@ -1663,7 +1663,7 @@ async function xlwmsSyncOrders(tenant, env, opts) {
     );
 
     if (!result.success) {
-      return { error: result.msg || "xlwms request failed", code: result.code };
+      return { error: result.msg || "xlwms request failed", code: result.code, raw: JSON.stringify(result).slice(0, 300) };
     }
 
     const records = (result.data && result.data.records) || [];
