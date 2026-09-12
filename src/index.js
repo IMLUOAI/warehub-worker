@@ -664,6 +664,22 @@ async function handleRequest(request, env, ctx) {
     if (method === "DELETE") return deleteFBA(tenant, fbaMatch[1], env);
   }
 
+  // ── Order history stats — how far back data goes, for reference when ──
+  // scanning leftover physical labels at Pack Station ────────────────────
+  if (path === "/api/orders/stats" && method === "GET") {
+    const stats = await env.DB.prepare(
+      `SELECT COUNT(*) as count, MIN(imported_at) as oldest, MAX(imported_at) as newest
+       FROM orders WHERE tenant_id = ?`
+    )
+      .bind(tenant.id)
+      .first();
+    return json({
+      count: stats?.count || 0,
+      oldest: stats?.oldest || null,
+      newest: stats?.newest || null,
+    });
+  }
+
   // ── Order lookup by tracking (queries DB directly, not client cache) ──
   if (path === "/api/orders/lookup" && method === "GET") {
     const url = new URL(request.url);
