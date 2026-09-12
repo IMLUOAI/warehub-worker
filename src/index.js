@@ -730,6 +730,12 @@ async function handleRequest(request, env, ctx) {
     if (method === "GET") return getFbaBatches(tenant, env);
     if (method === "POST") return createFbaBatch(request, tenant, env);
   }
+  const fbaBatchDeleteMatch = path.match(/^\/api\/fba-grid\/batches\/([^/]+)$/);
+  if (fbaBatchDeleteMatch && method === "DELETE") {
+    const denied = requireFeature(tenant, "fba");
+    if (denied) return denied;
+    return deleteFbaBatch(tenant, fbaBatchDeleteMatch[1], env);
+  }
   if (path === "/api/fba-grid") {
     const denied = requireFeature(tenant, "fba");
     if (denied) return denied;
@@ -1593,6 +1599,24 @@ async function createFbaBatch(request, tenant, env) {
     .bind(id, tenant.id, label)
     .run();
   return json({ id, label }, 201);
+}
+
+async function deleteFbaBatch(tenant, batchId, env) {
+  // Delete the batch's rows first, then the batch itself. If this was the
+  // most-recent (current) batch, getOrCreateCurrentBatch will transparently
+  // fall back to the next-most-recent one, or create a fresh "Batch 1" if
+  // none are left — the frontend just reloads afterward.
+  await env.DB.prepare(
+    `DELETE FROM fba_outbound_items WHERE batch_id = ? AND tenant_id = ?`
+  )
+    .bind(batchId, tenant.id)
+    .run();
+  await env.DB.prepare(
+    `DELETE FROM fba_batches WHERE id = ? AND tenant_id = ?`
+  )
+    .bind(batchId, tenant.id)
+    .run();
+  return json({ ok: true });
 }
 
 async function getFbaGrid(request, tenant, env) {
