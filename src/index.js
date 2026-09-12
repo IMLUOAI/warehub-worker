@@ -680,6 +680,19 @@ async function handleRequest(request, env, ctx) {
     });
   }
 
+  // ── Per-day import history — lets you see exactly how many labels came ──
+  // in on which day, to spot gaps or confirm a specific day's batch ────────
+  if (path === "/api/orders/history" && method === "GET") {
+    const { results } = await env.DB.prepare(
+      `SELECT date(imported_at) as day, COUNT(*) as count
+       FROM orders WHERE tenant_id = ?
+       GROUP BY day ORDER BY day DESC LIMIT 30`
+    )
+      .bind(tenant.id)
+      .all();
+    return json({ days: results });
+  }
+
   // ── Order lookup by tracking (queries DB directly, not client cache) ──
   if (path === "/api/orders/lookup" && method === "GET") {
     const url = new URL(request.url);
@@ -1270,12 +1283,30 @@ async function createOrders(request, tenant, env) {
   const insertedOrders = [];
   for (const o of b.orders) {
     const id = uuid();
-    await env.DB.prepare(
-      `INSERT INTO orders (id, tenant_id, tracking, carrier, shelf, status)
-       VALUES (?, ?, ?, ?, ?, 'pending')`
-    )
-      .bind(id, tenant.id, o.tracking, o.carrier || "Unknown", o.shelf || null)
-      .run();
+    // If the label itself carried a readable date (FedEx/SpeedX today —
+    // more carriers as extraction improves), backdate imported_at to that
+    // real date instead of always stamping "right now". This matters most
+    // when re-importing an older PDF to backfill history — without this,
+    // every re-import would land as "today" regardless of what day the
+    // PDF actually represents.
+    const importedAt = /^\d{4}-\d{2}-\d{2}$/.test(o.labelDate || "")
+      ? o.labelDate + " 12:00:00"
+      : null;
+    if (importedAt) {
+      await env.DB.prepare(
+        `INSERT INTO orders (id, tenant_id, tracking, carrier, shelf, status, imported_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?)`
+      )
+        .bind(id, tenant.id, o.tracking, o.carrier || "Unknown", o.shelf || null, importedAt)
+        .run();
+    } else {
+      await env.DB.prepare(
+        `INSERT INTO orders (id, tenant_id, tracking, carrier, shelf, status)
+         VALUES (?, ?, ?, ?, ?, 'pending')`
+      )
+        .bind(id, tenant.id, o.tracking, o.carrier || "Unknown", o.shelf || null)
+        .run();
+    }
     if (o.skus && o.skus.length) {
       for (const s of o.skus) {
         await env.DB.prepare(
