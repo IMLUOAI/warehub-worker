@@ -1295,8 +1295,24 @@ async function createOrders(request, tenant, env) {
   if (!Array.isArray(b.orders) || !b.orders.length)
     return err("orders array required");
   let inserted = 0;
+  let skippedDuplicates = 0;
   const insertedOrders = [];
   for (const o of b.orders) {
+    if (!o.tracking) continue;
+    // Skip if this tracking number already exists for this tenant — without
+    // this, the same batch getting synced twice (a page refresh mid-sync,
+    // re-importing the same PDF, syncing from two devices) just kept
+    // writing duplicate rows, inflating that day's count in Import History.
+    const existing = await env.DB.prepare(
+      `SELECT id FROM orders WHERE tenant_id = ? AND tracking = ? LIMIT 1`
+    )
+      .bind(tenant.id, o.tracking)
+      .first();
+    if (existing) {
+      skippedDuplicates++;
+      continue;
+    }
+
     const id = uuid();
     // If the label itself carried a readable date (FedEx/SpeedX today —
     // more carriers as extraction improves), backdate imported_at to that
@@ -1338,7 +1354,7 @@ async function createOrders(request, tenant, env) {
   if (insertedOrders.length) {
     fireWebhookEvent(tenant.id, "order.created", { orders: insertedOrders }, env).catch(() => {});
   }
-  return json({ inserted }, 201);
+  return json({ inserted, skippedDuplicates }, 201);
 }
 
 async function updateOrder(request, tenant, orderId, env) {
