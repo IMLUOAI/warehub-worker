@@ -698,11 +698,26 @@ async function handleRequest(request, env, ctx) {
     const url = new URL(request.url);
     const tracking = (url.searchParams.get("tracking") || "").trim();
     if (!tracking) return err("tracking is required");
-    const order = await env.DB.prepare(
+    let order = await env.DB.prepare(
       `SELECT * FROM orders WHERE tenant_id = ? AND tracking = ? ORDER BY imported_at DESC LIMIT 1`
     )
       .bind(tenant.id, tracking)
       .first();
+    if (!order) {
+      // Exact match failed — fall back to a general substring search. Some
+      // carriers store a modified version of the real tracking number
+      // internally (e.g. FedEx duplicates get a "_p78" suffix appended to
+      // stay unique — "963208...087_p78" — while the physical barcode is
+      // just the plain number). A substring match catches that and similar
+      // cases generically, without needing to hardcode each carrier's
+      // specific pattern. Tracking numbers are long/unique enough that
+      // false-positive matches are effectively a non-issue in practice.
+      order = await env.DB.prepare(
+        `SELECT * FROM orders WHERE tenant_id = ? AND tracking LIKE ? ORDER BY imported_at DESC LIMIT 1`
+      )
+        .bind(tenant.id, "%" + tracking + "%")
+        .first();
+    }
     if (!order) return json({ order: null });
     const { results: skus } = await env.DB.prepare(
       `SELECT sku, qty FROM order_skus WHERE tenant_id = ? AND order_id = ?`
