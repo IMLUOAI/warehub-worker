@@ -664,11 +664,76 @@ async function handleRequest(request, env, ctx) {
     if (method === "DELETE") return deleteFBA(tenant, fbaMatch[1], env);
   }
 
+  // ── Order lookup by tracking (queries DB directly, not client cache) ──
+  if (path === "/api/orders/lookup" && method === "GET") {
+    const url = new URL(request.url);
+    const tracking = (url.searchParams.get("tracking") || "").trim();
+    if (!tracking) return err("tracking is required");
+    const order = await env.DB.prepare(
+      `SELECT * FROM orders WHERE tenant_id = ? AND tracking = ? ORDER BY imported_at DESC LIMIT 1`
+    )
+      .bind(tenant.id, tracking)
+      .first();
+    if (!order) return json({ order: null });
+    const { results: skus } = await env.DB.prepare(
+      `SELECT sku, qty FROM order_skus WHERE tenant_id = ? AND order_id = ?`
+    )
+      .bind(tenant.id, order.id)
+      .all();
+    return json({ order: { ...order, skus } });
+  }
+
+  // ── Out-of-stock log — kept indefinitely (at least 7 days, no auto-purge) ──
+  if (path === "/api/out-of-stock" && method === "GET") {
+    const { results } = await env.DB.prepare(
+      `SELECT * FROM out_of_stock_log WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 1000`
+    )
+      .bind(tenant.id)
+      .all();
+    return json({ items: results });
+  }
+  if (path === "/api/out-of-stock" && method === "POST") {
+    const b = await request.json().catch(() => ({}));
+    if (!b.tracking) return err("tracking is required");
+    const id = uuid();
+    await env.DB.prepare(
+      `INSERT INTO out_of_stock_log (id, tenant_id, tracking, sku, carrier, order_id, reported_by, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        id,
+        tenant.id,
+        b.tracking,
+        b.sku || "",
+        b.carrier || "",
+        b.order_id || null,
+        b.reported_by || auth.userEmail || "",
+        b.notes || ""
+      )
+      .run();
+    return json({ id }, 201);
+  }
+  const oosMatch = path.match(/^\/api\/out-of-stock\/([^/]+)$/);
+  if (oosMatch && method === "DELETE") {
+    await env.DB.prepare(
+      `DELETE FROM out_of_stock_log WHERE id = ? AND tenant_id = ?`
+    )
+      .bind(oosMatch[1], tenant.id)
+      .run();
+    return json({ ok: true });
+  }
+
   // ── FBA Outbound grid (flat, spreadsheet-style) ─────────────────
+  if (path === "/api/fba-grid/batches") {
+    const denied = requireFeature(tenant, "fba");
+    if (denied) return denied;
+    if (method === "GET") return getFbaBatches(tenant, env);
+    if (method === "POST") return createFbaBatch(request, tenant, env);
+  }
   if (path === "/api/fba-grid") {
     const denied = requireFeature(tenant, "fba");
     if (denied) return denied;
-    if (method === "GET") return getFbaGrid(tenant, env);
+    if (method === "GET") return getFbaGrid(request, tenant, env);
     if (method === "POST") return createFbaGridRow(request, tenant, env);
   }
   const fbaGridMatch = path.match(/^\/api\/fba-grid\/([^/]+)$/);
@@ -1479,27 +1544,83 @@ async function deleteFBA(tenant, fbaId, env) {
 
 // ── FBA Outbound grid (flat, spreadsheet-style row entry) ──────────
 
-async function getFbaGrid(tenant, env) {
+// Returns the tenant's most-recently-created batch, auto-creating a first
+// one ("Batch 1") if none exists yet — so old pre-batching data and brand
+// new tenants both always have somewhere for new rows to land.
+async function getOrCreateCurrentBatch(tenant, env) {
+  const existing = await env.DB.prepare(
+    `SELECT id FROM fba_batches WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 1`
+  )
+    .bind(tenant.id)
+    .first();
+  if (existing) return existing.id;
+
+  const id = uuid();
+  await env.DB.prepare(
+    `INSERT INTO fba_batches (id, tenant_id, label) VALUES (?, ?, 'Batch 1')`
+  )
+    .bind(id, tenant.id)
+    .run();
+  return id;
+}
+
+async function getFbaBatches(tenant, env) {
   const { results } = await env.DB.prepare(
-    `SELECT * FROM fba_outbound_items WHERE tenant_id = ? ORDER BY created_at DESC`
+    `SELECT b.id, b.label, b.created_at,
+            (SELECT COUNT(*) FROM fba_outbound_items i WHERE i.batch_id = b.id) as item_count
+     FROM fba_batches b
+     WHERE b.tenant_id = ?
+     ORDER BY b.created_at DESC`
   )
     .bind(tenant.id)
     .all();
-  return json({ rows: results });
+  return json({ batches: results });
+}
+
+async function createFbaBatch(request, tenant, env) {
+  const b = await request.json().catch(() => ({}));
+  const { results: existing } = await env.DB.prepare(
+    `SELECT COUNT(*) as count FROM fba_batches WHERE tenant_id = ?`
+  )
+    .bind(tenant.id)
+    .all();
+  const nextNum = (existing[0]?.count || 0) + 1;
+  const id = uuid();
+  const label = (b.label || "").trim() || `Batch ${nextNum}`;
+  await env.DB.prepare(
+    `INSERT INTO fba_batches (id, tenant_id, label) VALUES (?, ?, ?)`
+  )
+    .bind(id, tenant.id, label)
+    .run();
+  return json({ id, label }, 201);
+}
+
+async function getFbaGrid(request, tenant, env) {
+  const url = new URL(request.url);
+  let batchId = url.searchParams.get("batchId");
+  if (!batchId) batchId = await getOrCreateCurrentBatch(tenant, env);
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM fba_outbound_items WHERE tenant_id = ? AND batch_id = ? ORDER BY created_at DESC`
+  )
+    .bind(tenant.id, batchId)
+    .all();
+  return json({ rows: results, batchId });
 }
 
 async function createFbaGridRow(request, tenant, env) {
   const b = await request.json().catch(() => ({}));
+  const batchId = b.batch_id || (await getOrCreateCurrentBatch(tenant, env));
   const id = uuid();
   await env.DB.prepare(
     `INSERT INTO fba_outbound_items
-       (id, tenant_id, ship_date, shipment_id, fulfillment_center, sku, qty,
+       (id, tenant_id, batch_id, ship_date, shipment_id, fulfillment_center, sku, qty,
         size, weight, carrier, tracking, boxes, submitted_by, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
       id,
       tenant.id,
+      batchId,
       b.ship_date || new Date().toISOString().slice(0, 10),
       b.shipment_id || "",
       b.fulfillment_center || "",
@@ -1514,7 +1635,7 @@ async function createFbaGridRow(request, tenant, env) {
       b.notes || ""
     )
     .run();
-  return json({ id }, 201);
+  return json({ id, batchId }, 201);
 }
 
 async function updateFbaGridRow(request, tenant, rowId, env) {
