@@ -1294,63 +1294,77 @@ async function createOrders(request, tenant, env) {
   const b = await request.json().catch(() => ({}));
   if (!Array.isArray(b.orders) || !b.orders.length)
     return err("orders array required");
+
+  const validOrders = b.orders.filter((o) => o.tracking);
   let inserted = 0;
   let skippedDuplicates = 0;
   const insertedOrders = [];
-  for (const o of b.orders) {
-    if (!o.tracking) continue;
-    // Skip if this tracking number already exists for this tenant — without
-    // this, the same batch getting synced twice (a page refresh mid-sync,
-    // re-importing the same PDF, syncing from two devices) just kept
-    // writing duplicate rows, inflating that day's count in Import History.
-    const existing = await env.DB.prepare(
-      `SELECT id FROM orders WHERE tenant_id = ? AND tracking = ? LIMIT 1`
+
+  // Process in chunks so each round-trip stays a reasonable size, but far
+  // fewer round-trips overall than one-per-order — a 1000+ order batch
+  // (which used to mean 2000+ sequential DB calls, taking well over a
+  // minute) now takes a small handful of batched calls, typically just a
+  // few seconds. This matters because until sync finishes, that batch's
+  // orders aren't yet findable via the Out-of-Stock lookup tool.
+  const CHUNK = 50;
+  for (let i = 0; i < validOrders.length; i += CHUNK) {
+    const chunk = validOrders.slice(i, i + CHUNK);
+    const trackings = chunk.map((o) => o.tracking);
+
+    // One round-trip to find which of this chunk's tracking numbers already
+    // exist, instead of one SELECT per order.
+    const placeholders = trackings.map(() => "?").join(",");
+    const { results: existingRows } = await env.DB.prepare(
+      `SELECT tracking FROM orders WHERE tenant_id = ? AND tracking IN (${placeholders})`
     )
-      .bind(tenant.id, o.tracking)
-      .first();
-    if (existing) {
-      skippedDuplicates++;
-      continue;
+      .bind(tenant.id, ...trackings)
+      .all();
+    const existingSet = new Set(existingRows.map((r) => r.tracking));
+
+    const statements = [];
+    for (const o of chunk) {
+      if (existingSet.has(o.tracking)) {
+        skippedDuplicates++;
+        continue;
+      }
+      const id = uuid();
+      const importedAt = /^\d{4}-\d{2}-\d{2}$/.test(o.labelDate || "")
+        ? o.labelDate + " 12:00:00"
+        : null;
+      if (importedAt) {
+        statements.push(
+          env.DB.prepare(
+            `INSERT INTO orders (id, tenant_id, tracking, carrier, shelf, status, imported_at)
+             VALUES (?, ?, ?, ?, ?, 'pending', ?)`
+          ).bind(id, tenant.id, o.tracking, o.carrier || "Unknown", o.shelf || null, importedAt)
+        );
+      } else {
+        statements.push(
+          env.DB.prepare(
+            `INSERT INTO orders (id, tenant_id, tracking, carrier, shelf, status)
+             VALUES (?, ?, ?, ?, ?, 'pending')`
+          ).bind(id, tenant.id, o.tracking, o.carrier || "Unknown", o.shelf || null)
+        );
+      }
+      if (o.skus && o.skus.length) {
+        for (const s of o.skus) {
+          statements.push(
+            env.DB.prepare(
+              `INSERT INTO order_skus (id, tenant_id, order_id, sku, qty)
+               VALUES (?, ?, ?, ?, ?)`
+            ).bind(uuid(), tenant.id, id, s.sku, s.qty || 1)
+          );
+        }
+      }
+      insertedOrders.push({ id, tracking: o.tracking, carrier: o.carrier || "Unknown" });
+      inserted++;
     }
 
-    const id = uuid();
-    // If the label itself carried a readable date (FedEx/SpeedX today —
-    // more carriers as extraction improves), backdate imported_at to that
-    // real date instead of always stamping "right now". This matters most
-    // when re-importing an older PDF to backfill history — without this,
-    // every re-import would land as "today" regardless of what day the
-    // PDF actually represents.
-    const importedAt = /^\d{4}-\d{2}-\d{2}$/.test(o.labelDate || "")
-      ? o.labelDate + " 12:00:00"
-      : null;
-    if (importedAt) {
-      await env.DB.prepare(
-        `INSERT INTO orders (id, tenant_id, tracking, carrier, shelf, status, imported_at)
-         VALUES (?, ?, ?, ?, ?, 'pending', ?)`
-      )
-        .bind(id, tenant.id, o.tracking, o.carrier || "Unknown", o.shelf || null, importedAt)
-        .run();
-    } else {
-      await env.DB.prepare(
-        `INSERT INTO orders (id, tenant_id, tracking, carrier, shelf, status)
-         VALUES (?, ?, ?, ?, ?, 'pending')`
-      )
-        .bind(id, tenant.id, o.tracking, o.carrier || "Unknown", o.shelf || null)
-        .run();
+    if (statements.length) {
+      await env.DB.batch(statements);
     }
-    if (o.skus && o.skus.length) {
-      for (const s of o.skus) {
-        await env.DB.prepare(
-          `INSERT INTO order_skus (id, tenant_id, order_id, sku, qty)
-           VALUES (?, ?, ?, ?, ?)`
-        )
-          .bind(uuid(), tenant.id, id, s.sku, s.qty || 1)
-          .run();
-      }
-    }
-    insertedOrders.push({ id, tracking: o.tracking, carrier: o.carrier || "Unknown" });
-    inserted++;
   }
+
   if (insertedOrders.length) {
     fireWebhookEvent(tenant.id, "order.created", { orders: insertedOrders }, env).catch(() => {});
   }
