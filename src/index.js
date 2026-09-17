@@ -502,6 +502,14 @@ async function handleRequest(request, env, ctx) {
     if (result.error) return json({ error: result.error, code: result.code, raw: result.raw }, 502);
     return json(result);
   }
+  if (path === "/api/integrations/xlwms/sync-inventory" && method === "POST") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    const b = await request.json().catch(() => ({}));
+    const result = await xlwmsSyncInventoryLocations(tenant, env, b);
+    if (result.error) return json({ error: result.error, code: result.code, raw: result.raw }, 502);
+    return json(result);
+  }
 
   // ── API integrations (owner only) — keys + outbound webhooks ────
   if (path === "/api/integrations/keys" && method === "GET") {
@@ -1875,6 +1883,73 @@ async function xlwmsRequest(path, dataObj, env) {
     }),
   });
   return resp.json();
+}
+
+// Pulls bin-level inventory records from xlwms (a transaction LEDGER, not a
+// current-state snapshot — every stock movement is logged) and derives
+// "what's at each location right now" by keeping only the MOST RECENT
+// record per (location, SKU) pair, sorted newest-first. A location+SKU
+// whose latest closeQty is 0 means that stock has since moved out, so it's
+// excluded — otherwise a sold-through item would still "show" at its last
+// known location forever.
+async function xlwmsSyncInventoryLocations(tenant, env, opts) {
+  opts = opts || {};
+  const pageSize = 1000;
+  const MAX_PAGES = 50; // safety cap — up to 50,000 ledger records per sync
+  let page = 1;
+  let totalPages = 1;
+  const seen = {}; // "cellNo||sku" -> true, once we've taken its newest record
+  const current = {}; // cellNo -> { sku -> {qty, name} }
+
+  do {
+    const result = await xlwmsRequest(
+      "/openapi/v2/stock/stockCellBook/page",
+      {
+        current: page,
+        size: pageSize,
+        startTime: opts.startTime || new Date(Date.now() - 180 * 24 * 3600000).toISOString().slice(0, 19).replace("T", " "),
+        endTime: opts.endTime || new Date().toISOString().slice(0, 19).replace("T", " "),
+        sortName: "createTime",
+        sortOrder: "desc",
+      },
+      env
+    );
+
+    if (!result.success) {
+      return { error: result.msg || "xlwms request failed", code: result.code, raw: JSON.stringify(result).slice(0, 300) };
+    }
+
+    const records = (result.data && result.data.records) || [];
+    totalPages = (result.data && result.data.pages) || 1;
+
+    for (const rec of records) {
+      const cellNo = (rec.cellNo || "").trim();
+      const sku = (rec.productSku || "").trim();
+      if (!cellNo || !sku) continue;
+      const key = cellNo + "||" + sku;
+      if (seen[key]) continue; // already have this pair's most recent record
+      seen[key] = true;
+
+      const qty = Number(rec.closeQty) || 0;
+      if (qty <= 0) continue; // most recent state is "none left here" — skip
+
+      if (!current[cellNo]) current[cellNo] = { skus: [] };
+      current[cellNo].skus.push({ sku, qty, name: rec.productName || "" });
+    }
+    page++;
+  } while (page <= totalPages && page <= MAX_PAGES);
+
+  const locationCount = Object.keys(current).length;
+  const skuCount = Object.values(current).reduce((n, loc) => n + loc.skus.length, 0);
+
+  await env.DB.prepare(
+    `INSERT INTO settings (tenant_id, key, value) VALUES (?, 'rack_inventory', ?)
+     ON CONFLICT(tenant_id, key) DO UPDATE SET value = excluded.value`
+  )
+    .bind(tenant.id, JSON.stringify(current))
+    .run();
+
+  return { locations: locationCount, skus: skuCount };
 }
 
 // Pulls recent outbound orders from xlwms and imports them as pending
