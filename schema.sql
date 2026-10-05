@@ -194,3 +194,43 @@ CREATE TABLE IF NOT EXISTS billing_events (
   event_type   TEXT NOT NULL,
   created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- ── In-app feedback / support requests ───────────────────────────
+CREATE TABLE IF NOT EXISTS feedback (
+  id            TEXT PRIMARY KEY,
+  tenant_id     TEXT NOT NULL REFERENCES tenants(id),
+  user_id       TEXT,
+  user_email    TEXT,
+  user_name     TEXT,
+  page          TEXT,
+  category      TEXT DEFAULT 'general',
+  message       TEXT NOT NULL,
+  debug_log     TEXT,
+  user_agent    TEXT,
+  app_version   TEXT,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  status        TEXT NOT NULL DEFAULT 'open'
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_tenant ON feedback(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback(status);
+CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created_at);
+
+
+-- ── Per-tenant ERP connectors ────────────────────────────────────
+CREATE TABLE IF NOT EXISTS integrations (
+  id              TEXT PRIMARY KEY,
+  tenant_id       TEXT NOT NULL REFERENCES tenants(id),
+  provider        TEXT NOT NULL,
+  display_name    TEXT,
+  credentials_json TEXT NOT NULL DEFAULT '{}',
+  config_json     TEXT NOT NULL DEFAULT '{}',
+  active          INTEGER NOT NULL DEFAULT 1,
+  last_sync_at    TEXT,
+  last_sync_status TEXT,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (tenant_id, provider)
+);
+CREATE INDEX IF NOT EXISTS idx_integrations_tenant ON integrations(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_integrations_provider ON integrations(tenant_id, provider);
+

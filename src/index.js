@@ -493,7 +493,88 @@ async function handleRequest(request, env, ctx) {
     return json({ issues: results });
   }
 
-  // ── xlwms integration (owner only) — pull outbound orders ───────
+  // ── Per-tenant ERP connectors (owner only) ──────────────────────
+  if (path === "/api/integrations/connectors" && method === "GET") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    try {
+      const { results } = await env.DB.prepare(
+        `SELECT id, provider, display_name, active, last_sync_at, last_sync_status, created_at, updated_at,
+                CASE WHEN credentials_json IS NOT NULL AND credentials_json != '{}' THEN 1 ELSE 0 END as has_credentials
+         FROM integrations WHERE tenant_id = ? ORDER BY provider`
+      )
+        .bind(tenant.id)
+        .all();
+      return json({ connectors: results || [] });
+    } catch (e) {
+      // Table missing before migration
+      return json({ connectors: [], hint: "Run integrations_migration.sql" });
+    }
+  }
+
+  if (path === "/api/integrations/connectors" && method === "POST") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    const b = await request.json().catch(() => ({}));
+    const provider = String(b.provider || "").trim().toLowerCase();
+    if (!provider || !/^[a-z0-9_-]{2,40}$/.test(provider)) {
+      return err("provider is required (e.g. xlwms)");
+    }
+    const appKey = String(b.app_key || "").trim();
+    const appSecret = String(b.app_secret || "").trim();
+    if (!appKey || !appSecret) return err("app_key and app_secret are required");
+    if (appKey.length > 200 || appSecret.length > 200) return err("Credentials too long");
+
+    const id = uuid();
+    const displayName = String(b.display_name || provider).slice(0, 80);
+    const credsJson = JSON.stringify({ app_key: appKey, app_secret: appSecret });
+    const configJson = JSON.stringify(b.config || {});
+
+    try {
+      // Upsert: one connector per provider per tenant
+      const existing = await env.DB.prepare(
+        `SELECT id FROM integrations WHERE tenant_id = ? AND provider = ?`
+      )
+        .bind(tenant.id, provider)
+        .first();
+
+      if (existing) {
+        await env.DB.prepare(
+          `UPDATE integrations
+           SET credentials_json = ?, config_json = ?, display_name = ?, active = 1,
+               updated_at = datetime('now')
+           WHERE id = ? AND tenant_id = ?`
+        )
+          .bind(credsJson, configJson, displayName, existing.id, tenant.id)
+          .run();
+        return json({ id: existing.id, provider, updated: true });
+      }
+
+      await env.DB.prepare(
+        `INSERT INTO integrations (id, tenant_id, provider, display_name, credentials_json, config_json, active)
+         VALUES (?, ?, ?, ?, ?, ?, 1)`
+      )
+        .bind(id, tenant.id, provider, displayName, credsJson, configJson)
+        .run();
+      return json({ id, provider, created: true }, 201);
+    } catch (e) {
+      return err("Failed to save connector: " + e.message, 500);
+    }
+  }
+
+  const connectorMatch = path.match(/^\/api\/integrations\/connectors\/([^/]+)$/);
+  if (connectorMatch && method === "DELETE") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    await env.DB.prepare(
+      `DELETE FROM integrations WHERE id = ? AND tenant_id = ?`
+    )
+      .bind(connectorMatch[1], tenant.id)
+      .run();
+    return json({ ok: true });
+  }
+
+  // ── xlwms sync (owner only) — uses per-tenant credentials ───────
   if (path === "/api/integrations/xlwms/sync" && method === "POST") {
     const denied = requireOwner(auth);
     if (denied) return denied;
@@ -773,6 +854,51 @@ async function handleRequest(request, env, ctx) {
       .bind(oosMatch[1], tenant.id)
       .run();
     return json({ ok: true });
+  }
+
+  // ── In-app feedback / support ───────────────────────────────────
+  if (path === "/api/feedback" && method === "POST") {
+    const b = await request.json().catch(() => ({}));
+    const message = (b.message || "").trim();
+    if (!message || message.length < 3) return err("Please describe the issue or request");
+    if (message.length > 4000) return err("Message too long (max 4000 characters)");
+
+    const id = uuid();
+    const debugLog = typeof b.debug_log === "string" ? b.debug_log.slice(-8000) : "";
+    await env.DB.prepare(
+      `INSERT INTO feedback
+         (id, tenant_id, user_id, user_email, user_name, page, category, message, debug_log, user_agent, app_version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        id,
+        tenant.id,
+        auth.userId || null,
+        auth.userEmail || b.user_email || "",
+        b.user_name || "",
+        (b.page || "").slice(0, 80),
+        (b.category || "general").slice(0, 40),
+        message,
+        debugLog,
+        (b.user_agent || "").slice(0, 300),
+        (b.app_version || "").slice(0, 40)
+      )
+      .run();
+
+    return json({ id, ok: true }, 201);
+  }
+
+  // Owner can list recent feedback for their own tenant
+  if (path === "/api/feedback" && method === "GET") {
+    const denied = requireOwner(auth);
+    if (denied) return denied;
+    const { results } = await env.DB.prepare(
+      `SELECT id, user_email, user_name, page, category, message, status, created_at
+       FROM feedback WHERE tenant_id = ? ORDER BY created_at DESC LIMIT 100`
+    )
+      .bind(tenant.id)
+      .all();
+    return json({ items: results || [] });
   }
 
   // ── FBA Outbound grid (flat, spreadsheet-style) ─────────────────
@@ -1865,18 +1991,76 @@ async function xlwmsSign(dataObj, appKey, appSecret, timestamp) {
     .join("");
 }
 
-async function xlwmsRequest(path, dataObj, env) {
-  if (!env.XLWMS_APP_KEY || !env.XLWMS_APP_SECRET) {
-    return { error: { message: "xlwms credentials not configured on this Worker" } };
+/**
+ * Load per-tenant integration credentials for a provider.
+ * Falls back to global Worker secrets only for 'xlwms' (legacy/demo).
+ * Returns { app_key, app_secret, config, integrationId } or null.
+ */
+async function getTenantIntegration(tenantId, provider, env) {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT id, credentials_json, config_json, active
+       FROM integrations WHERE tenant_id = ? AND provider = ? AND active = 1`
+    )
+      .bind(tenantId, provider)
+      .first();
+    if (row && row.credentials_json) {
+      const creds = JSON.parse(row.credentials_json);
+      if (creds.app_key && creds.app_secret) {
+        return {
+          app_key: creds.app_key,
+          app_secret: creds.app_secret,
+          config: row.config_json ? JSON.parse(row.config_json) : {},
+          integrationId: row.id,
+        };
+      }
+    }
+  } catch (e) {
+    // Table may not exist yet before migration — fall through
+    console.error("[integrations] load failed:", e.message);
+  }
+
+  // Legacy fallback: global Worker secrets (single shared account — do not rely on for multi-tenant)
+  if (provider === "xlwms" && env.XLWMS_APP_KEY && env.XLWMS_APP_SECRET) {
+    return {
+      app_key: env.XLWMS_APP_KEY,
+      app_secret: env.XLWMS_APP_SECRET,
+      config: {},
+      integrationId: null,
+      legacyGlobal: true,
+    };
+  }
+  return null;
+}
+
+async function markIntegrationSync(env, integrationId, status) {
+  if (!integrationId) return;
+  try {
+    await env.DB.prepare(
+      `UPDATE integrations SET last_sync_at = datetime('now'), last_sync_status = ?, updated_at = datetime('now') WHERE id = ?`
+    )
+      .bind(String(status).slice(0, 200), integrationId)
+      .run();
+  } catch (e) { /* ignore */ }
+}
+
+async function xlwmsRequest(path, dataObj, credentials) {
+  if (!credentials || !credentials.app_key || !credentials.app_secret) {
+    return {
+      error: {
+        message:
+          "Lingxing / xlwms is not connected for this account. Open API Access → Connectors and add your App Key & App Secret.",
+      },
+    };
   }
   const timestamp = String(Math.floor(Date.now() / 1000));
-  const sign = await xlwmsSign(dataObj, env.XLWMS_APP_KEY, env.XLWMS_APP_SECRET, timestamp);
+  const sign = await xlwmsSign(dataObj, credentials.app_key, credentials.app_secret, timestamp);
 
   const resp = await fetch("https://api.xlwms.com" + path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      appKey: env.XLWMS_APP_KEY,
+      appKey: credentials.app_key,
       timestamp,
       sign,
       data: dataObj,
@@ -1894,6 +2078,13 @@ async function xlwmsRequest(path, dataObj, env) {
 // known location forever.
 async function xlwmsSyncInventoryLocations(tenant, env, opts) {
   opts = opts || {};
+  const creds = await getTenantIntegration(tenant.id, "xlwms", env);
+  if (!creds) {
+    return {
+      error:
+        "Lingxing / xlwms is not connected. Open API Access → Connectors and enter your App Key & App Secret.",
+    };
+  }
   const pageSize = 1000;
   const MAX_PAGES = 50; // safety cap — up to 50,000 ledger records per sync
   let page = 1;
@@ -1912,10 +2103,15 @@ async function xlwmsSyncInventoryLocations(tenant, env, opts) {
         sortName: "createTime",
         sortOrder: "desc",
       },
-      env
+      creds
     );
 
+    if (result.error) {
+      await markIntegrationSync(env, creds.integrationId, result.error.message || "error");
+      return { error: result.error.message || "xlwms request failed" };
+    }
     if (!result.success) {
+      await markIntegrationSync(env, creds.integrationId, result.msg || "error");
       return { error: result.msg || "xlwms request failed", code: result.code, raw: JSON.stringify(result).slice(0, 300) };
     }
 
@@ -1949,6 +2145,7 @@ async function xlwmsSyncInventoryLocations(tenant, env, opts) {
     .bind(tenant.id, JSON.stringify(current))
     .run();
 
+  await markIntegrationSync(env, creds.integrationId, "ok");
   return { locations: locationCount, skus: skuCount };
 }
 
@@ -1956,6 +2153,13 @@ async function xlwmsSyncInventoryLocations(tenant, env, opts) {
 // orders in D1 — same shape as a manual PDF label import, just automated.
 async function xlwmsSyncOrders(tenant, env, opts) {
   opts = opts || {};
+  const creds = await getTenantIntegration(tenant.id, "xlwms", env);
+  if (!creds) {
+    return {
+      error:
+        "Lingxing / xlwms is not connected. Open API Access → Connectors and enter your App Key & App Secret.",
+    };
+  }
   const pageSize = 100;
   let page = 1;
   let imported = 0;
@@ -1971,10 +2175,15 @@ async function xlwmsSyncOrders(tenant, env, opts) {
         startTime: opts.startTime || new Date(Date.now() - 24 * 3600000).toISOString().slice(0, 19).replace("T", " "),
         endTime: opts.endTime || new Date().toISOString().slice(0, 19).replace("T", " "),
       },
-      env
+      creds
     );
 
+    if (result.error) {
+      await markIntegrationSync(env, creds.integrationId, result.error.message || "error");
+      return { error: result.error.message || "xlwms request failed" };
+    }
     if (!result.success) {
+      await markIntegrationSync(env, creds.integrationId, result.msg || "error");
       return { error: result.msg || "xlwms request failed", code: result.code, raw: JSON.stringify(result).slice(0, 300) };
     }
 
@@ -2019,6 +2228,7 @@ async function xlwmsSyncOrders(tenant, env, opts) {
     page++;
   } while (page <= totalPages && page <= 20); // safety cap: 20 pages per sync
 
+  await markIntegrationSync(env, creds.integrationId, "ok");
   return { imported };
 }
 
