@@ -1462,9 +1462,10 @@ async function createOrders(request, tenant, env) {
         continue;
       }
       const id = uuid();
-      const importedAt = /^\d{4}-\d{2}-\d{2}$/.test(o.labelDate || "")
-        ? o.labelDate + " 12:00:00"
-        : null;
+      const importDay = /^\d{4}-\d{2}-\d{2}$/.test(o.importedOn || "")
+        ? o.importedOn
+        : (/^\d{4}-\d{2}-\d{2}$/.test(o.labelDate || "") ? o.labelDate : "");
+      const importedAt = importDay ? importDay + " 12:00:00" : null;
       if (importedAt) {
         statements.push(
           env.DB.prepare(
