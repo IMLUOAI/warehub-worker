@@ -739,6 +739,12 @@ async function handleRequest(request, env, ctx) {
     if (method === "DELETE") return deleteReturn(tenant, returnMatch[1], env);
   }
 
+  // ── Receiving log ─────────────────────────────────────────────
+  if (path === "/api/receiving") {
+    if (method === "GET") return getReceiving(tenant, env);
+    if (method === "POST") return createReceiving(request, tenant, env);
+  }
+
   // ── FBA ───────────────────────────────────────────────────────
   if (path === "/api/fba") {
     const denied = requireFeature(tenant, "fba");
@@ -1657,6 +1663,63 @@ async function deleteTrip(tenant, tripId, env) {
 }
 
 // ── Returns ───────────────────────────────────────────────────────
+
+
+async function ensureReceivingTable(env) {
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS receiving_log (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      sku TEXT NOT NULL,
+      location TEXT,
+      qty INTEGER DEFAULT 1,
+      received_date TEXT,
+      received_time TEXT,
+      scanned_by TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`
+  ).run();
+}
+
+async function getReceiving(tenant, env) {
+  await ensureReceivingTable(env);
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM receiving_log WHERE tenant_id = ?
+     ORDER BY received_date DESC, received_time DESC`
+  )
+    .bind(tenant.id)
+    .all();
+  return json({ receiving: results });
+}
+
+async function createReceiving(request, tenant, env) {
+  await ensureReceivingTable(env);
+  const b = await request.json().catch(() => ({}));
+  const rows = Array.isArray(b.entries) ? b.entries : [b];
+  const inserted = [];
+  for (const row of rows) {
+    if (!row || !row.sku) continue;
+    const id = uuid();
+    await env.DB.prepare(
+      `INSERT INTO receiving_log
+         (id, tenant_id, sku, location, qty, received_date, received_time, scanned_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        id,
+        tenant.id,
+        row.sku,
+        row.location || null,
+        row.qty || 1,
+        row.received_date || row.date || new Date().toISOString().slice(0, 10),
+        row.received_time || row.time || new Date().toTimeString().slice(0, 8),
+        row.scanned_by || row.by || null
+      )
+      .run();
+    inserted.push({ id, sku: row.sku });
+  }
+  return json({ ok: true, inserted }, 201);
+}
 
 async function getReturns(tenant, env) {
   const { results } = await env.DB.prepare(
