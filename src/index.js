@@ -1375,9 +1375,21 @@ async function updatePacker(request, tenant, packerId, env) {
 }
 
 async function deletePacker(tenant, packerId, env) {
+  const row = await env.DB.prepare(
+    `SELECT name, is_manager FROM packers WHERE id = ? AND tenant_id = ?`
+  )
+    .bind(packerId, tenant.id)
+    .first();
   await env.DB.prepare(`DELETE FROM packers WHERE id = ? AND tenant_id = ?`)
     .bind(packerId, tenant.id)
     .run();
+  if (row && row.name && !row.is_manager) {
+    await env.DB.prepare(
+      `DELETE FROM packers WHERE tenant_id = ? AND is_manager = 0 AND lower(name) = lower(?)`
+    )
+      .bind(tenant.id, row.name)
+      .run();
+  }
   return json({ ok: true });
 }
 
