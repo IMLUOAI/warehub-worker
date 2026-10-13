@@ -1202,7 +1202,24 @@ async function getPackers(tenant, env) {
 
 async function syncPackers(request, tenant, env) {
   const b = await request.json().catch(() => ({}));
-  const list = b.packers || [];
+  const list = Array.isArray(b.packers) ? b.packers : [];
+
+  if (b.replace) {
+    const keep = list.map((p) => p && p.id).filter(Boolean);
+    if (keep.length) {
+      const placeholders = keep.map(() => "?").join(",");
+      await env.DB.prepare(
+        `DELETE FROM packers WHERE tenant_id = ? AND id NOT IN (${placeholders})`
+      )
+        .bind(tenant.id, ...keep)
+        .run();
+    } else {
+      await env.DB.prepare(`DELETE FROM packers WHERE tenant_id = ?`)
+        .bind(tenant.id)
+        .run();
+    }
+  }
+
   if (!list.length) return json({ ok: true, synced: 0 });
 
   const limits = planLimitsFor(tenant);
