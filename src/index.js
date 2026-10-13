@@ -518,7 +518,7 @@ async function handleRequest(request, env, ctx) {
     const b = await request.json().catch(() => ({}));
     const provider = String(b.provider || "").trim().toLowerCase();
     if (!provider || !/^[a-z0-9_-]{2,40}$/.test(provider)) {
-      return err("provider is required (e.g. xlwms)");
+      return err("provider is required");
     }
     const appKey = String(b.app_key || "").trim();
     const appSecret = String(b.app_secret || "").trim();
@@ -572,24 +572,6 @@ async function handleRequest(request, env, ctx) {
       .bind(connectorMatch[1], tenant.id)
       .run();
     return json({ ok: true });
-  }
-
-  // ── xlwms sync (owner only) — uses per-tenant credentials ───────
-  if (path === "/api/integrations/xlwms/sync" && method === "POST") {
-    const denied = requireOwner(auth);
-    if (denied) return denied;
-    const b = await request.json().catch(() => ({}));
-    const result = await xlwmsSyncOrders(tenant, env, b);
-    if (result.error) return json({ error: result.error, code: result.code, raw: result.raw }, 502);
-    return json(result);
-  }
-  if (path === "/api/integrations/xlwms/sync-inventory" && method === "POST") {
-    const denied = requireOwner(auth);
-    if (denied) return denied;
-    const b = await request.json().catch(() => ({}));
-    const result = await xlwmsSyncInventoryLocations(tenant, env, b);
-    if (result.error) return json({ error: result.error, code: result.code, raw: result.raw }, 502);
-    return json(result);
   }
 
   // ── API integrations (owner only) — keys + outbound webhooks ────
@@ -1203,23 +1185,6 @@ async function getPackers(tenant, env) {
 async function syncPackers(request, tenant, env) {
   const b = await request.json().catch(() => ({}));
   const list = Array.isArray(b.packers) ? b.packers : [];
-
-  if (b.replace) {
-    const keep = list.map((p) => p && p.id).filter(Boolean);
-    if (keep.length) {
-      const placeholders = keep.map(() => "?").join(",");
-      await env.DB.prepare(
-        `DELETE FROM packers WHERE tenant_id = ? AND id NOT IN (${placeholders})`
-      )
-        .bind(tenant.id, ...keep)
-        .run();
-    } else {
-      await env.DB.prepare(`DELETE FROM packers WHERE tenant_id = ?`)
-        .bind(tenant.id)
-        .run();
-    }
-  }
-
   const deleteIds = Array.isArray(b.deleteIds) ? b.deleteIds.filter(Boolean) : [];
   for (const id of deleteIds) {
     await deletePacker(tenant, id, env);
@@ -1380,21 +1345,9 @@ async function updatePacker(request, tenant, packerId, env) {
 }
 
 async function deletePacker(tenant, packerId, env) {
-  const row = await env.DB.prepare(
-    `SELECT name, is_manager FROM packers WHERE id = ? AND tenant_id = ?`
-  )
-    .bind(packerId, tenant.id)
-    .first();
   await env.DB.prepare(`DELETE FROM packers WHERE id = ? AND tenant_id = ?`)
     .bind(packerId, tenant.id)
     .run();
-  if (row && row.name && !row.is_manager) {
-    await env.DB.prepare(
-      `DELETE FROM packers WHERE tenant_id = ? AND is_manager = 0 AND lower(name) = lower(?)`
-    )
-      .bind(tenant.id, row.name)
-      .run();
-  }
   return json({ ok: true });
 }
 
@@ -2051,284 +2004,6 @@ async function saveSettings(request, tenant, env) {
 }
 
 // ── Stripe helpers ────────────────────────────────────────────────
-
-// ══════════════════════════════════════════════════════════════════
-//  xlwms (领星WMS) Integration — pull outbound orders/labels
-//  Credentials come from env.XLWMS_APP_KEY / env.XLWMS_APP_SECRET
-//  (set via `wrangler secret put`, never stored in source or DB).
-// ══════════════════════════════════════════════════════════════════
-
-// Recursively sorts object keys alphabetically — JS's default key order
-// isn't guaranteed to match "字典升序排序" (dictionary ascending order),
-// so this makes it explicit before JSON.stringify.
-function sortKeysDeep(value) {
-  if (Array.isArray(value)) return value.map(sortKeysDeep);
-  if (value && typeof value === "object") {
-    const sorted = {};
-    for (const key of Object.keys(value).sort()) {
-      sorted[key] = sortKeysDeep(value[key]);
-    }
-    return sorted;
-  }
-  return value;
-}
-
-async function xlwmsSign(dataObj, appKey, appSecret, timestamp) {
-  const dataStr = JSON.stringify(sortKeysDeep(dataObj));
-  const concatStr = appKey + dataStr + timestamp;
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(appSecret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  const sigBuf = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(concatStr));
-  return Array.from(new Uint8Array(sigBuf))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-/**
- * Load per-tenant integration credentials for a provider.
- * Falls back to global Worker secrets only for 'xlwms' (legacy/demo).
- * Returns { app_key, app_secret, config, integrationId } or null.
- */
-async function getTenantIntegration(tenantId, provider, env) {
-  try {
-    const row = await env.DB.prepare(
-      `SELECT id, credentials_json, config_json, active
-       FROM integrations WHERE tenant_id = ? AND provider = ? AND active = 1`
-    )
-      .bind(tenantId, provider)
-      .first();
-    if (row && row.credentials_json) {
-      const creds = JSON.parse(row.credentials_json);
-      if (creds.app_key && creds.app_secret) {
-        return {
-          app_key: creds.app_key,
-          app_secret: creds.app_secret,
-          config: row.config_json ? JSON.parse(row.config_json) : {},
-          integrationId: row.id,
-        };
-      }
-    }
-  } catch (e) {
-    // Table may not exist yet before migration — fall through
-    console.error("[integrations] load failed:", e.message);
-  }
-
-  // Legacy fallback: global Worker secrets (single shared account — do not rely on for multi-tenant)
-  if (provider === "xlwms" && env.XLWMS_APP_KEY && env.XLWMS_APP_SECRET) {
-    return {
-      app_key: env.XLWMS_APP_KEY,
-      app_secret: env.XLWMS_APP_SECRET,
-      config: {},
-      integrationId: null,
-      legacyGlobal: true,
-    };
-  }
-  return null;
-}
-
-async function markIntegrationSync(env, integrationId, status) {
-  if (!integrationId) return;
-  try {
-    await env.DB.prepare(
-      `UPDATE integrations SET last_sync_at = datetime('now'), last_sync_status = ?, updated_at = datetime('now') WHERE id = ?`
-    )
-      .bind(String(status).slice(0, 200), integrationId)
-      .run();
-  } catch (e) { /* ignore */ }
-}
-
-async function xlwmsRequest(path, dataObj, credentials) {
-  if (!credentials || !credentials.app_key || !credentials.app_secret) {
-    return {
-      error: {
-        message:
-          "Lingxing / xlwms is not connected for this account. Open API Access → Connectors and add your App Key & App Secret.",
-      },
-    };
-  }
-  const timestamp = String(Math.floor(Date.now() / 1000));
-  const sign = await xlwmsSign(dataObj, credentials.app_key, credentials.app_secret, timestamp);
-
-  const resp = await fetch("https://api.xlwms.com" + path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      appKey: credentials.app_key,
-      timestamp,
-      sign,
-      data: dataObj,
-    }),
-  });
-  return resp.json();
-}
-
-// Pulls bin-level inventory records from xlwms (a transaction LEDGER, not a
-// current-state snapshot — every stock movement is logged) and derives
-// "what's at each location right now" by keeping only the MOST RECENT
-// record per (location, SKU) pair, sorted newest-first. A location+SKU
-// whose latest closeQty is 0 means that stock has since moved out, so it's
-// excluded — otherwise a sold-through item would still "show" at its last
-// known location forever.
-async function xlwmsSyncInventoryLocations(tenant, env, opts) {
-  opts = opts || {};
-  const creds = await getTenantIntegration(tenant.id, "xlwms", env);
-  if (!creds) {
-    return {
-      error:
-        "Lingxing / xlwms is not connected. Open API Access → Connectors and enter your App Key & App Secret.",
-    };
-  }
-  const pageSize = 1000;
-  const MAX_PAGES = 50; // safety cap — up to 50,000 ledger records per sync
-  let page = 1;
-  let totalPages = 1;
-  const seen = {}; // "cellNo||sku" -> true, once we've taken its newest record
-  const current = {}; // cellNo -> { sku -> {qty, name} }
-
-  do {
-    const result = await xlwmsRequest(
-      "/openapi/v2/stock/stockCellBook/page",
-      {
-        current: page,
-        size: pageSize,
-        startTime: opts.startTime || new Date(Date.now() - 180 * 24 * 3600000).toISOString().slice(0, 19).replace("T", " "),
-        endTime: opts.endTime || new Date().toISOString().slice(0, 19).replace("T", " "),
-        sortName: "createTime",
-        sortOrder: "desc",
-      },
-      creds
-    );
-
-    if (result.error) {
-      await markIntegrationSync(env, creds.integrationId, result.error.message || "error");
-      return { error: result.error.message || "xlwms request failed" };
-    }
-    if (!result.success) {
-      await markIntegrationSync(env, creds.integrationId, result.msg || "error");
-      return { error: result.msg || "xlwms request failed", code: result.code, raw: JSON.stringify(result).slice(0, 300) };
-    }
-
-    const records = (result.data && result.data.records) || [];
-    totalPages = (result.data && result.data.pages) || 1;
-
-    for (const rec of records) {
-      const cellNo = (rec.cellNo || "").trim();
-      const sku = (rec.productSku || "").trim();
-      if (!cellNo || !sku) continue;
-      const key = cellNo + "||" + sku;
-      if (seen[key]) continue; // already have this pair's most recent record
-      seen[key] = true;
-
-      const qty = Number(rec.closeQty) || 0;
-      if (qty <= 0) continue; // most recent state is "none left here" — skip
-
-      if (!current[cellNo]) current[cellNo] = { skus: [] };
-      current[cellNo].skus.push({ sku, qty, name: rec.productName || "" });
-    }
-    page++;
-  } while (page <= totalPages && page <= MAX_PAGES);
-
-  const locationCount = Object.keys(current).length;
-  const skuCount = Object.values(current).reduce((n, loc) => n + loc.skus.length, 0);
-
-  await env.DB.prepare(
-    `INSERT INTO settings (tenant_id, key, value) VALUES (?, 'rack_inventory', ?)
-     ON CONFLICT(tenant_id, key) DO UPDATE SET value = excluded.value`
-  )
-    .bind(tenant.id, JSON.stringify(current))
-    .run();
-
-  await markIntegrationSync(env, creds.integrationId, "ok");
-  return { locations: locationCount, skus: skuCount };
-}
-
-// Pulls recent outbound orders from xlwms and imports them as pending
-// orders in D1 — same shape as a manual PDF label import, just automated.
-async function xlwmsSyncOrders(tenant, env, opts) {
-  opts = opts || {};
-  const creds = await getTenantIntegration(tenant.id, "xlwms", env);
-  if (!creds) {
-    return {
-      error:
-        "Lingxing / xlwms is not connected. Open API Access → Connectors and enter your App Key & App Secret.",
-    };
-  }
-  const pageSize = 100;
-  let page = 1;
-  let imported = 0;
-  let totalPages = 1;
-
-  do {
-    const result = await xlwmsRequest(
-      "/openapi/v2/order/delivery/page",
-      {
-        current: page,
-        size: pageSize,
-        timeType: "createTime",
-        startTime: opts.startTime || new Date(Date.now() - 24 * 3600000).toISOString().slice(0, 19).replace("T", " "),
-        endTime: opts.endTime || new Date().toISOString().slice(0, 19).replace("T", " "),
-      },
-      creds
-    );
-
-    if (result.error) {
-      await markIntegrationSync(env, creds.integrationId, result.error.message || "error");
-      return { error: result.error.message || "xlwms request failed" };
-    }
-    if (!result.success) {
-      await markIntegrationSync(env, creds.integrationId, result.msg || "error");
-      return { error: result.msg || "xlwms request failed", code: result.code, raw: JSON.stringify(result).slice(0, 300) };
-    }
-
-    const records = (result.data && result.data.records) || [];
-    totalPages = (result.data && result.data.pages) || 1;
-
-    for (const rec of records) {
-      // Avoid re-importing the same order on repeated syncs.
-      const existing = await env.DB.prepare(
-        `SELECT id FROM orders WHERE tenant_id = ? AND tracking = ?`
-      )
-        .bind(tenant.id, rec.expressNo || rec.sourceNo)
-        .first();
-      if (existing) continue;
-
-      const id = uuid();
-      await env.DB.prepare(
-        `INSERT INTO orders (id, tenant_id, tracking, carrier, shelf, status)
-         VALUES (?, ?, ?, ?, ?, 'pending')`
-      )
-        .bind(
-          id,
-          tenant.id,
-          rec.expressNo || rec.sourceNo || "",
-          rec.logisticsChannelName || rec.logisticsChannel || "Unknown",
-          null
-        )
-        .run();
-
-      if (Array.isArray(rec.productList)) {
-        for (const p of rec.productList) {
-          await env.DB.prepare(
-            `INSERT INTO order_skus (id, tenant_id, order_id, sku, qty)
-             VALUES (?, ?, ?, ?, ?)`
-          )
-            .bind(uuid(), tenant.id, id, p.productSku || "", p.qty || 1)
-            .run();
-        }
-      }
-      imported++;
-    }
-    page++;
-  } while (page <= totalPages && page <= 20); // safety cap: 20 pages per sync
-
-  await markIntegrationSync(env, creds.integrationId, "ok");
-  return { imported };
-}
 
 const STRIPE_PRICES = {
   basic: "price_1U8a4YRrPnCkZ2Dx2A94sTLI",
