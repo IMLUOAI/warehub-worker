@@ -680,7 +680,7 @@ async function handleRequest(request, env, ctx) {
   }
   const packerMatch = path.match(/^\/api\/packers\/([^/]+)$/);
   if (packerMatch) {
-    const id = packerMatch[1];
+    const id = decodeURIComponent(packerMatch[1]);
     if (method === "PATCH") return updatePacker(request, tenant, id, env);
     if (method === "DELETE") return deletePacker(tenant, id, env);
   }
@@ -1218,6 +1218,11 @@ async function syncPackers(request, tenant, env) {
         .bind(tenant.id)
         .run();
     }
+  }
+
+  const deleteIds = Array.isArray(b.deleteIds) ? b.deleteIds.filter(Boolean) : [];
+  for (const id of deleteIds) {
+    await deletePacker(tenant, id, env);
   }
 
   if (!list.length) return json({ ok: true, synced: 0 });
