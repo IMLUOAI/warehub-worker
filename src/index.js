@@ -1350,40 +1350,19 @@ async function deletePacker(tenant, packerId, env) {
   )
     .bind(packerId, tenant.id)
     .first();
-
-  let ids = [packerId];
+  await env.DB.prepare(`DELETE FROM packers WHERE id = ? AND tenant_id = ?`)
+    .bind(packerId, tenant.id)
+    .run();
   if (row && row.name) {
-    const { results } = await env.DB.prepare(
-      `SELECT id FROM packers WHERE tenant_id = ? AND lower(name) = lower(?)`
+    await env.DB.prepare(
+      `DELETE FROM packers WHERE tenant_id = ? AND lower(name) = lower(?)`
     )
       .bind(tenant.id, row.name)
-      .all();
-    ids = (results || []).map((r) => r.id);
-    if (!ids.includes(packerId)) ids.push(packerId);
-  }
-
-  for (const id of ids) {
-    await env.DB.prepare(
-      `DELETE FROM packer_sessions WHERE packer_id = ? AND tenant_id = ?`
-    )
-      .bind(id, tenant.id)
-      .run();
-    await env.DB.prepare(
-      `UPDATE orders SET assigned_to = NULL WHERE assigned_to = ? AND tenant_id = ?`
-    )
-      .bind(id, tenant.id)
-      .run();
-    await env.DB.prepare(
-      `UPDATE orders SET packed_by = NULL WHERE packed_by = ? AND tenant_id = ?`
-    )
-      .bind(id, tenant.id)
-      .run();
-    await env.DB.prepare(`DELETE FROM packers WHERE id = ? AND tenant_id = ?`)
-      .bind(id, tenant.id)
       .run();
   }
   return json({ ok: true });
 }
+
 // ── Sessions ──────────────────────────────────────────────────────
 
 async function getSessions(request, tenant, env) {
