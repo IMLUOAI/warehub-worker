@@ -916,6 +916,19 @@ async function handleRequest(request, env, ctx) {
     if (method === "DELETE") return deleteFbaGridRow(tenant, fbaGridMatch[1], env);
   }
 
+  // ── Recover bin ─────────────────────────────────────────────────
+  if (path === "/api/trash" && method === "GET") {
+    return listTrash(request, tenant, env);
+  }
+  const trashRestore = path.match(/^\/api\/trash\/([^/]+)\/restore$/);
+  if (trashRestore && method === "POST") {
+    return restoreTrash(tenant, trashRestore[1], env);
+  }
+  const trashOne = path.match(/^\/api\/trash\/([^/]+)$/);
+  if (trashOne && method === "DELETE") {
+    return purgeTrash(tenant, trashOne[1], env);
+  }
+
   // ── Settings ──────────────────────────────────────────────────
   if (path === "/api/settings") {
     if (method === "GET") return getSettings(tenant, env);
@@ -1350,19 +1363,40 @@ async function deletePacker(tenant, packerId, env) {
   )
     .bind(packerId, tenant.id)
     .first();
-  await env.DB.prepare(`DELETE FROM packers WHERE id = ? AND tenant_id = ?`)
-    .bind(packerId, tenant.id)
-    .run();
+
+  let ids = [packerId];
   if (row && row.name) {
-    await env.DB.prepare(
-      `DELETE FROM packers WHERE tenant_id = ? AND lower(name) = lower(?)`
+    const { results } = await env.DB.prepare(
+      `SELECT id FROM packers WHERE tenant_id = ? AND lower(name) = lower(?)`
     )
       .bind(tenant.id, row.name)
+      .all();
+    ids = (results || []).map((r) => r.id);
+    if (!ids.includes(packerId)) ids.push(packerId);
+  }
+
+  for (const id of ids) {
+    await env.DB.prepare(
+      `DELETE FROM packer_sessions WHERE packer_id = ? AND tenant_id = ?`
+    )
+      .bind(id, tenant.id)
+      .run();
+    await env.DB.prepare(
+      `UPDATE orders SET assigned_to = NULL WHERE assigned_to = ? AND tenant_id = ?`
+    )
+      .bind(id, tenant.id)
+      .run();
+    await env.DB.prepare(
+      `UPDATE orders SET packed_by = NULL WHERE packed_by = ? AND tenant_id = ?`
+    )
+      .bind(id, tenant.id)
+      .run();
+    await env.DB.prepare(`DELETE FROM packers WHERE id = ? AND tenant_id = ?`)
+      .bind(id, tenant.id)
       .run();
   }
   return json({ ok: true });
 }
-
 // ── Sessions ──────────────────────────────────────────────────────
 
 async function getSessions(request, tenant, env) {
@@ -1652,7 +1686,215 @@ async function createTrip(request, tenant, env) {
   return json({ id }, 201);
 }
 
+async function ensureTrash(env) {
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS deleted_items (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      source TEXT NOT NULL,
+      record_id TEXT,
+      label TEXT,
+      payload TEXT NOT NULL,
+      deleted_at INTEGER DEFAULT (unixepoch())
+    )`
+  ).run();
+}
+
+async function stashDeleted(env, tenant, source, recordId, payload, label) {
+  await ensureTrash(env);
+  await env.DB.prepare(
+    `INSERT INTO deleted_items (id, tenant_id, source, record_id, label, payload)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      uuid(),
+      tenant.id,
+      source,
+      recordId || "",
+      (label || "").slice(0, 180),
+      JSON.stringify(payload || {})
+    )
+    .run();
+}
+
+async function listTrash(request, tenant, env) {
+  await ensureTrash(env);
+  const source = new URL(request.url).searchParams.get("source") || "";
+  const stmt = source
+    ? env.DB.prepare(
+        `SELECT id, source, record_id, label, payload, deleted_at
+         FROM deleted_items WHERE tenant_id = ? AND source = ?
+         ORDER BY deleted_at DESC LIMIT 500`
+      ).bind(tenant.id, source)
+    : env.DB.prepare(
+        `SELECT id, source, record_id, label, payload, deleted_at
+         FROM deleted_items WHERE tenant_id = ?
+         ORDER BY deleted_at DESC LIMIT 500`
+      ).bind(tenant.id);
+  const { results } = await stmt.all();
+  return json({
+    items: (results || []).map((row) => {
+      let record = {};
+      try { record = JSON.parse(row.payload || "{}"); } catch (e) {}
+      return {
+        id: row.id,
+        source: row.source,
+        record_id: row.record_id,
+        label: row.label,
+        deleted_at: row.deleted_at,
+        record,
+      };
+    }),
+  });
+}
+
+async function purgeTrash(tenant, id, env) {
+  await ensureTrash(env);
+  await env.DB.prepare(`DELETE FROM deleted_items WHERE id = ? AND tenant_id = ?`)
+    .bind(id, tenant.id)
+    .run();
+  return json({ ok: true });
+}
+
+async function restoreTrash(tenant, id, env) {
+  await ensureTrash(env);
+  const row = await env.DB.prepare(
+    `SELECT * FROM deleted_items WHERE id = ? AND tenant_id = ?`
+  )
+    .bind(id, tenant.id)
+    .first();
+  if (!row) return err("Not in the recover bin", 404);
+  let payload = {};
+  try { payload = JSON.parse(row.payload || "{}"); } catch (e) {}
+  const newId = uuid();
+
+  if (row.source === "fba") {
+    let batchId = payload.batch_id || null;
+    if (batchId) {
+      const batch = await env.DB.prepare(
+        `SELECT id FROM fba_batches WHERE id = ? AND tenant_id = ?`
+      )
+        .bind(batchId, tenant.id)
+        .first();
+      if (!batch) batchId = null;
+    }
+    if (!batchId) batchId = await getOrCreateCurrentBatch(tenant, env);
+    await env.DB.prepare(
+      `INSERT INTO fba_outbound_items
+         (id, tenant_id, batch_id, ship_date, shipment_id, fulfillment_center, sku, qty,
+          size, weight, carrier, tracking, boxes, submitted_by, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        newId, tenant.id, batchId,
+        payload.ship_date || new Date().toISOString().slice(0, 10),
+        payload.shipment_id || "",
+        payload.fulfillment_center || "",
+        payload.sku || "",
+        payload.qty || 0,
+        payload.size || "",
+        payload.weight || null,
+        payload.carrier || "",
+        payload.tracking || "",
+        payload.boxes || null,
+        payload.submitted_by || "",
+        payload.notes || ""
+      )
+      .run();
+  } else if (row.source === "returns") {
+    await env.DB.prepare(
+      `INSERT INTO returns
+         (id, tenant_id, tracking, carrier, type, condition, sku, qty,
+          pile, location, notes, scanned_by, mgr_review, return_date, return_time)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        newId, tenant.id,
+        payload.tracking || null,
+        payload.carrier || null,
+        payload.type || null,
+        payload.condition || null,
+        payload.sku || null,
+        payload.qty || 1,
+        payload.pile || null,
+        payload.location || null,
+        payload.notes || null,
+        payload.scanned_by || payload.scannedBy || null,
+        payload.mgr_review || payload.mgrReview ? 1 : 0,
+        payload.return_date || payload.date || new Date().toISOString().slice(0, 10),
+        payload.return_time || payload.time || new Date().toTimeString().slice(0, 8)
+      )
+      .run();
+  } else if (row.source === "vehicle") {
+    await env.DB.prepare(
+      `INSERT INTO vehicle_trips
+         (id, tenant_id, driver, destination, depart_time, return_time,
+          odo_start, odo_end, miles, notes, trip_date)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        newId, tenant.id,
+        payload.driver || "",
+        payload.destination || payload.dest || "",
+        payload.depart_time || payload.depart || null,
+        payload.return_time || payload.ret || null,
+        payload.odo_start || payload.odoStart || null,
+        payload.odo_end || payload.odoEnd || null,
+        payload.miles || null,
+        payload.notes || null,
+        payload.trip_date || payload.date || new Date().toISOString().slice(0, 10)
+      )
+      .run();
+  } else if (row.source === "fba-log") {
+    const ship = payload.shipment || payload;
+    await env.DB.prepare(
+      `INSERT INTO fba_shipments
+         (id, tenant_id, shipment_id, fulfillment_center, units, boxes, dims, weight,
+          carrier, tracking, submitted_by, notes, ship_date)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        newId, tenant.id,
+        ship.shipment_id || ship.shipId || "",
+        ship.fulfillment_center || ship.fc || "",
+        ship.units || null,
+        ship.boxes || null,
+        ship.dims || null,
+        ship.weight || null,
+        ship.carrier || "",
+        ship.tracking || "",
+        ship.submitted_by || ship.by || "",
+        ship.notes || "",
+        ship.ship_date || ship.date || new Date().toISOString().slice(0, 10)
+      )
+      .run();
+    const skus = payload.skus || ship.skus || [];
+    for (const s of skus) {
+      await env.DB.prepare(
+        `INSERT INTO fba_skus (id, tenant_id, shipment_id, sku, qty) VALUES (?, ?, ?, ?, ?)`
+      )
+        .bind(uuid(), tenant.id, newId, s.sku || "", s.qty || 0)
+        .run();
+    }
+  } else {
+    return err("This recover bin item cannot be restored automatically");
+  }
+
+  await env.DB.prepare(`DELETE FROM deleted_items WHERE id = ? AND tenant_id = ?`)
+    .bind(id, tenant.id)
+    .run();
+  return json({ ok: true, id: newId });
+}
+
 async function deleteTrip(tenant, tripId, env) {
+  const row = await env.DB.prepare(
+    `SELECT * FROM vehicle_trips WHERE id = ? AND tenant_id = ?`
+  )
+    .bind(tripId, tenant.id)
+    .first();
+  if (row) {
+    await stashDeleted(env, tenant, "vehicle", tripId, row, row.destination || row.driver || "Trip");
+  }
   await env.DB.prepare(
     `DELETE FROM vehicle_trips WHERE id = ? AND tenant_id = ?`
   )
@@ -1761,6 +2003,14 @@ async function createReturn(request, tenant, env) {
 }
 
 async function deleteReturn(tenant, returnId, env) {
+  const row = await env.DB.prepare(
+    `SELECT * FROM returns WHERE id = ? AND tenant_id = ?`
+  )
+    .bind(returnId, tenant.id)
+    .first();
+  if (row) {
+    await stashDeleted(env, tenant, "returns", returnId, row, row.tracking || row.sku || "Return");
+  }
   await env.DB.prepare(`DELETE FROM returns WHERE id = ? AND tenant_id = ?`)
     .bind(returnId, tenant.id)
     .run();
@@ -1829,6 +2079,26 @@ async function createFBA(request, tenant, env) {
 }
 
 async function deleteFBA(tenant, fbaId, env) {
+  const shipment = await env.DB.prepare(
+    `SELECT * FROM fba_shipments WHERE id = ? AND tenant_id = ?`
+  )
+    .bind(fbaId, tenant.id)
+    .first();
+  const { results: skus } = await env.DB.prepare(
+    `SELECT sku, qty FROM fba_skus WHERE shipment_id = ? AND tenant_id = ?`
+  )
+    .bind(fbaId, tenant.id)
+    .all();
+  if (shipment) {
+    await stashDeleted(
+      env, tenant, "fba-log", fbaId,
+      { shipment, skus: skus || [] },
+      shipment.shipment_id || "FBA shipment"
+    );
+  }
+  await env.DB.prepare(`DELETE FROM fba_skus WHERE shipment_id = ? AND tenant_id = ?`)
+    .bind(fbaId, tenant.id)
+    .run();
   await env.DB.prepare(
     `DELETE FROM fba_shipments WHERE id = ? AND tenant_id = ?`
   )
@@ -1891,10 +2161,22 @@ async function createFbaBatch(request, tenant, env) {
 }
 
 async function deleteFbaBatch(tenant, batchId, env) {
-  // Delete the batch's rows first, then the batch itself. If this was the
-  // most-recent (current) batch, getOrCreateCurrentBatch will transparently
-  // fall back to the next-most-recent one, or create a fresh "Batch 1" if
-  // none are left — the frontend just reloads afterward.
+  const batch = await env.DB.prepare(
+    `SELECT * FROM fba_batches WHERE id = ? AND tenant_id = ?`
+  )
+    .bind(batchId, tenant.id)
+    .first();
+  const { results } = await env.DB.prepare(
+    `SELECT * FROM fba_outbound_items WHERE batch_id = ? AND tenant_id = ?`
+  )
+    .bind(batchId, tenant.id)
+    .all();
+  for (const row of results || []) {
+    await stashDeleted(
+      env, tenant, "fba", row.id, row,
+      (row.sku || row.shipment_id || "FBA row") + (batch && batch.label ? " · " + batch.label : "")
+    );
+  }
   await env.DB.prepare(
     `DELETE FROM fba_outbound_items WHERE batch_id = ? AND tenant_id = ?`
   )
@@ -1975,6 +2257,14 @@ async function updateFbaGridRow(request, tenant, rowId, env) {
 }
 
 async function deleteFbaGridRow(tenant, rowId, env) {
+  const row = await env.DB.prepare(
+    `SELECT * FROM fba_outbound_items WHERE id = ? AND tenant_id = ?`
+  )
+    .bind(rowId, tenant.id)
+    .first();
+  if (row) {
+    await stashDeleted(env, tenant, "fba", rowId, row, row.sku || row.shipment_id || "FBA row");
+  }
   await env.DB.prepare(
     `DELETE FROM fba_outbound_items WHERE id = ? AND tenant_id = ?`
   )
